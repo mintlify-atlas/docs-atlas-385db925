@@ -1,0 +1,154 @@
+---
+title: "Using Redis as a Broccoli Queue Broker Backend"
+sidebarTitle: "Redis"
+description: "Configure Broccoli Queue with a Redis backend. Covers connection URLs, bb8 connection pooling, priority queues, scheduling, and the Redis-specific fairness queue implementation."
+---
+
+Redis is the default broker backend for Broccoli Queue and the most feature-complete option available. It is backed by [bb8](https://crates.io/crates/bb8) for async connection pooling, uses Redis sorted sets for priority-ordered delivery, and is the only backend that supports fairness (disambiguator) queues. If you are starting a new project and do not have strong reasons to choose another broker, Redis is the recommended choice.
+
+## Feature Flag
+
+The `redis` feature is enabled by default. You do not need to opt in explicitly unless you have disabled default features.
+
+```toml
+[dependencies]
+broccoli_queue = "0.4"  # redis is the default feature
+```
+
+If you have disabled default features and want only Redis:
+
+```toml
+[dependencies]
+broccoli_queue = { version = "0.4", features = ["redis"] }
+```
+
+## Connection URL Format
+
+Redis connection URLs follow the standard `redis://` scheme:
+
+| Scheme | Example |
+|---|---|
+| Plain TCP | `redis://localhost:6379` |
+| With password | `redis://:mypassword@localhost:6379` |
+| With database index | `redis://localhost:6379/2` |
+| TLS | `redis+tls://localhost:6380` |
+
+## Connecting
+
+Pass the Redis URL to `BroccoliQueue::builder` and configure the connection pool size and retry strategy before calling `build`:
+
+```rust
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .pool_connections(10)
+    .failed_message_retry_strategy(Default::default())
+    .build()
+    .await?;
+```
+
+The `pool_connections` value sets the maximum number of connections `bb8` will maintain in the pool. The default is `10` and the connection acquisition timeout is **2 seconds**.
+
+## Starting Redis with Docker
+
+```bash
+docker run -p 6379:6379 redis:latest
+```
+
+## Internal Redis Data Structures
+
+Understanding how Broccoli Queue maps its abstractions onto Redis primitives helps with debugging and capacity planning.
+
+<CardGroup cols={2}>
+  <Card title="Sorted Set — Main Queue" icon="layer-group" href="https://redis.io/docs/data-types/sorted-sets/">
+    Each topic is stored as a Redis sorted set (`ZADD`). The score is computed as `priority × timestamp_nanoseconds`, so lower scores are consumed first.
+  </Card>
+  <Card title="List — Processing Queue" icon="list" href="https://redis.io/docs/data-types/lists/">
+    When a message is dequeued for processing it is pushed onto a `{queue_name}_processing` list (`LPUSH`). On acknowledgement it is removed with `LREM`.
+  </Card>
+  <Card title="List — Failed Queue" icon="circle-exclamation" href="https://redis.io/docs/data-types/lists/">
+    Messages that exceed the configured retry limit are pushed onto a `{queue_name}_failed` list via `LPUSH`.
+  </Card>
+  <Card title="Hash — Message Storage" icon="database" href="https://redis.io/docs/data-types/hashes/">
+    Each individual message is stored as a Redis hash (`HSET`) keyed by `task_id`, containing the fields `task_id`, `payload`, `attempts`, and `priority`.
+  </Card>
+</CardGroup>
+
+### Priority Scoring
+
+Priority values range from `1` (highest) to `5` (lowest). The ZADD score is calculated as:
+
+```
+score = priority × unix_timestamp_nanoseconds
+```
+
+Because Redis sorted sets pop the **lowest** score first, a message with priority `1` will always be ahead of a message with priority `5` at the same timestamp.
+
+### Scheduling and Delayed Delivery
+
+When `enable_scheduling` is set in the broker config, Broccoli Queue adjusts the ZADD score to represent a future time:
+
+- **Delay**: `score += delay_seconds × 1_000_000_000`
+- **Scheduled at**: `score = scheduled_at_unix_timestamp_nanoseconds`
+
+The consume script (`ZPOPMIN`) compares the popped score against `5 × current_time_nanoseconds`. If the score exceeds that threshold the message is put back into the sorted set and `nil` is returned — effectively deferring it until its scheduled time arrives.
+
+### Message TTL
+
+When a `PublishOptions::ttl` is provided, Broccoli Queue calls `PEXPIRE` on the message hash key immediately after storing it:
+
+```rust
+redis_connection
+    .pexpire::<&str, String>(
+        &msg.task_id.to_string(),
+        (ttl.as_seconds_f64() * 1000.0) as i64,
+    )
+    .await?;
+```
+
+## Connection Pool Details
+
+The bb8 pool is built with the following defaults, which can be tuned via `BrokerConfig`:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `pool_connections` | `10` | Maximum simultaneous Redis connections |
+| `connection_timeout` | `2 s` | Time to wait before failing a connection attempt |
+
+If a connection cannot be obtained from the pool, Broccoli Queue rebuilds the pool with exponential back-off (starting at 1 second, capped at 5 minutes).
+
+## Fairness Queues (Redis-only)
+
+<Note>
+Fairness queues are implemented exclusively in the Redis broker. They are not available with RabbitMQ or SurrealDB.
+</Note>
+
+Fairness queues allow multiple publishers identified by a **disambiguator** string to share a single logical topic while guaranteeing round-robin consumption across those publishers. Internally, Broccoli Queue maintains two additional Redis keys per topic:
+
+- **`{queue_name}_fairness_set`** — a Redis Set (`SADD` / `SREM`) that tracks which disambiguators are currently active.
+- **`{queue_name}_fairness_round_robin`** — a Redis List that acts as a circular queue of disambiguator names for round-robin selection.
+
+Each disambiguator gets its own sorted set: `{queue_name}_{disambiguator}_queue`.
+
+On publish the Lua script registers a new disambiguator in the set and the round-robin list if it has not been seen before:
+
+```lua
+redis.call('ZADD', queue_name, priority * score, task_id)
+if disambiguator ~= '' then
+    local fairness_set = string.format("%s_fairness_set", base_queue_name)
+    local exists = redis.call('SISMEMBER', fairness_set, disambiguator)
+    if exists == 0 then
+        redis.call('SADD', fairness_set, disambiguator)
+        redis.call('RPUSH', fairness_round_robin, disambiguator)
+    end
+end
+```
+
+On consume with `ConsumeOptions { fairness: Some(true) }`, the script pops the next disambiguator from the round-robin list, pops the highest-priority message from that disambiguator's sorted set, and re-appends the disambiguator to the tail of the round-robin list if messages remain.
+
+## Production Tips
+
+<Tip>
+For high-availability production deployments, use Redis Sentinel or Redis Cluster URLs. The `redis` crate used by Broccoli Queue supports both:
+
+- **Sentinel**: `redis+sentinel://sentinel-host:26379/mymaster`
+- **Cluster**: `redis+cluster://node1:6379,node2:6379`
+</Tip>

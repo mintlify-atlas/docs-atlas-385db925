@@ -1,0 +1,160 @@
+---
+title: "Using RabbitMQ as a Broccoli Queue Broker Backend"
+sidebarTitle: "RabbitMQ"
+description: "Configure Broccoli Queue with a RabbitMQ backend via the rabbitmq feature. Covers AMQP URLs, connection pooling with deadpool-lapin, message priority, and the delayed-exchange plugin."
+---
+
+The RabbitMQ backend connects Broccoli Queue to a running RabbitMQ server using the AMQP 0-9-1 protocol. Connection pooling is handled by [deadpool-lapin](https://crates.io/crates/deadpool-lapin), which manages a pool of AMQP connections over a Tokio async runtime. On first connect, Broccoli Queue declares a durable `broccoli` exchange that all queues bind to, keeping your broker configuration consistent regardless of how many topics you create.
+
+## Feature Flag
+
+The `rabbitmq` feature is **not** enabled by default. Add it explicitly and disable the default `redis` feature if you do not need Redis:
+
+```toml
+[dependencies]
+broccoli_queue = { version = "0.4", features = ["rabbitmq"], default-features = false }
+```
+
+To use both backends in the same binary, enable both features:
+
+```toml
+[dependencies]
+broccoli_queue = { version = "0.4", features = ["redis", "rabbitmq"] }
+```
+
+## Connection URL Format
+
+RabbitMQ uses standard AMQP URLs:
+
+| Component | Example |
+|---|---|
+| Default vhost | `amqp://guest:guest@localhost:5672` |
+| Custom vhost | `amqp://user:password@host:5672/myvhost` |
+| TLS | `amqps://user:password@host:5671` |
+
+## Connecting
+
+```rust
+let queue = BroccoliQueue::builder("amqp://guest:guest@localhost:5672")
+    .pool_connections(10)
+    .build()
+    .await?;
+```
+
+### What Happens on Connect
+
+<Steps>
+  <Step title="Pool Creation">
+    `deadpool-lapin` builds a connection pool with `max_size` equal to `pool_connections` (default `10`). Each timeout — wait, create, and recycle — is set to **2 seconds**.
+  </Step>
+  <Step title="Initial Connection">
+    A connection is immediately borrowed from the pool to verify connectivity and create a channel for exchange setup.
+  </Step>
+  <Step title="Exchange Declaration">
+    The `broccoli` exchange is declared. Without scheduling enabled this is a standard `direct` exchange. With scheduling enabled (and the delayed-message plugin installed) it becomes an `x-delayed-message` exchange with `x-delayed-type: direct`.
+  </Step>
+</Steps>
+
+## Starting RabbitMQ with Docker
+
+```bash
+docker run -p 5672:5672 -p 15672:15672 rabbitmq:management
+```
+
+<Tip>
+The management UI is available at [http://localhost:15672](http://localhost:15672). Default credentials are `guest` / `guest`. Use the UI to inspect queues, message rates, bindings, and dead-letter exchanges in real time.
+</Tip>
+
+## Message Priority
+
+Each queue is declared with the `x-max-priority` argument set to `5`, enabling native RabbitMQ priority queues. Priority values accepted by `PublishOptions` range from `1` (highest) to `5` (lowest). Because RabbitMQ treats higher numeric values as higher priority, Broccoli Queue inverts the value internally before setting the AMQP `priority` property:
+
+```rust
+properties = properties.with_priority(5 - priority);
+```
+
+This means a Broccoli priority of `1` maps to an AMQP priority of `4`, preserving the convention that `1` is the most urgent.
+
+## Queue Setup Details
+
+Every time a message is published to a new topic, Broccoli Queue calls `queue_declare` with the following AMQP arguments:
+
+| Argument | Value | Purpose |
+|---|---|---|
+| `x-max-priority` | `5` | Enable priority queue support |
+| `x-dead-letter-exchange` | `""` (default exchange) | Route rejected messages automatically |
+| `x-dead-letter-routing-key` | `{queue_name}_failed` | Route dead-lettered messages to the failed queue |
+| `durable` | `true` | Survive broker restarts |
+
+A corresponding `{queue_name}_failed` queue is always declared alongside the main queue to capture messages that exceed retry limits or are rejected without requeueing.
+
+## Delayed Messages and Scheduling
+
+Scheduling support requires the official `rabbitmq_delayed_message_exchange` plugin. Without it the `broccoli` exchange is created as a plain `direct` exchange and `delay`/`scheduled_at` publish options are silently ignored.
+
+### Enabling the Plugin
+
+```bash
+rabbitmq-plugins enable rabbitmq_delayed_message_exchange
+```
+
+### Using the Pre-built Docker Image
+
+The repository ships a `Dockerfile.rabbitmq` that bakes the plugin directly into the image:
+
+```dockerfile
+FROM rabbitmq:4.0.9-management
+
+USER root
+RUN apt-get update && apt-get install -y wget && rm -rf /var/lib/apt/lists/*
+
+# Download and install the delayed message exchange plugin
+RUN wget https://github.com/rabbitmq/rabbitmq-delayed-message-exchange/releases/download/v4.0.7/rabbitmq_delayed_message_exchange-v4.0.7.ez \
+    -O /opt/rabbitmq/plugins/rabbitmq_delayed_message_exchange-v4.0.7.ez
+
+RUN chown rabbitmq:rabbitmq /opt/rabbitmq/plugins/rabbitmq_delayed_message_exchange-v4.0.7.ez && \
+    chmod 644 /opt/rabbitmq/plugins/rabbitmq_delayed_message_exchange-v4.0.7.ez
+
+RUN rabbitmq-plugins enable rabbitmq_delayed_message_exchange
+
+USER rabbitmq
+```
+
+Build and run it:
+
+```bash
+docker build -f Dockerfile.rabbitmq -t broccoli-rabbitmq .
+docker run -p 5672:5672 -p 15672:15672 broccoli-rabbitmq
+```
+
+When scheduling is enabled in the broker config, Broccoli Queue sets the `x-delay` header (in milliseconds) on each published message:
+
+```rust
+table.insert(
+    "x-delay".to_string().into(),
+    AMQPValue::LongLongInt(delay.whole_milliseconds() as i64),
+);
+```
+
+For `scheduled_at`, the delay is computed as `scheduled_at - now` in milliseconds.
+
+## Message Persistence
+
+All messages are published with `delivery_mode: 2` (persistent), ensuring they survive a RabbitMQ broker restart even if the consumer has not yet acknowledged them.
+
+## Fairness Queues
+
+<Warning>
+Fairness (disambiguator) queues are **not supported** with the RabbitMQ backend. The `disambiguator` parameter passed to `publish` is silently ignored. Use the Redis backend if you require per-publisher fair scheduling.
+</Warning>
+
+## Management Feature
+
+<Note>
+The optional `management` feature flag works with the RabbitMQ broker in addition to Redis. Enabling it unlocks additional introspection APIs on `BroccoliQueue` for queue inspection and administration.
+</Note>
+
+```toml
+[dependencies]
+broccoli_queue = { version = "0.4", features = ["rabbitmq", "management"], default-features = false }
+```

@@ -1,0 +1,138 @@
+---
+title: "Broccoli Queue: Type-Safe Async Jobs for Rust"
+sidebarTitle: "Introduction"
+description: "Broccoli Queue is a Rust message queue library inspired by Celery. Async-first, broker-agnostic, and type-safe with Redis, RabbitMQ, and SurrealDB support."
+---
+
+Broccoli Queue is a robust, async-first message queue library for Rust applications — a spiritual successor to Python's [Celery](https://docs.celeryq.dev/en/stable/getting-started/introduction.html), rebuilt from the ground up with Rust's ownership model, Tokio's async runtime, and end-to-end type safety. If you need to fan out background jobs, schedule deferred work, or distribute processing across multiple workers, Broccoli gives you a clean, ergonomic API that works the same way regardless of whether your broker is Redis, RabbitMQ, or SurrealDB. Messages are strongly typed through `BrokerMessage<T>`, serialization errors are caught at compile time, and every operation returns a proper `Result` — no panics, no stringly-typed payloads.
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="Async Processing" icon="bolt" href="/quickstart">
+    Built on Tokio. Every publish, consume, and process operation is fully async with configurable concurrency, so your workers never block a thread waiting for I/O.
+  </Card>
+  <Card title="Multiple Broker Backends" icon="database" href="/brokers/redis">
+    Switch between Redis, RabbitMQ, and SurrealDB by changing a single URL and a feature flag. The API stays identical across all brokers.
+  </Card>
+  <Card title="Type-Safe Messages" icon="shield-check" href="/quickstart">
+    Every message is wrapped in `BrokerMessage<T>` where `T` must implement `Serialize + DeserializeOwned`. Bad payloads are a compile-time error, not a runtime surprise.
+  </Card>
+  <Card title="Configurable Retry Strategies" icon="rotate-right" href="/concepts/retry-strategy">
+    Failed messages are automatically moved to a retry queue. Control the maximum number of attempts and whether retries are enabled at all via `RetryStrategy`.
+  </Card>
+  <Card title="Fairness Scheduling" icon="scale-balanced" href="/guides/fairness">
+    Use a `disambiguator` when publishing to route messages into per-tenant sub-queues, ensuring no single producer can starve others. Supported on the Redis broker.
+  </Card>
+  <Card title="Message Scheduling & Priorities" icon="clock" href="/guides/scheduling">
+    Publish messages with a `delay`, an exact `scheduled_at` timestamp, or a numeric `priority` (1–5). Deferred messages are delivered only when their scheduled time arrives.
+  </Card>
+</CardGroup>
+
+## Architecture Overview
+
+Broccoli Queue is organized around three primary abstractions:
+
+**`BroccoliQueue`** is the top-level handle you interact with. It wraps a connected broker and exposes `publish`, `consume`, `acknowledge`, `reject`, and `process_messages`. It is cheaply cloneable (backed by `Arc`) so you can share it across tasks.
+
+**Broker backends** implement the internal `Broker` trait, which handles the low-level transport (Redis lists/streams, AMQP channels, SurrealDB tables). You select a broker at build time by passing the appropriate URL to `BroccoliQueue::builder`.
+
+**`BrokerMessage<T>`** is the envelope that wraps every user-defined payload. It carries a `task_id` (UUID v4), the typed `payload: T`, retry metadata, and optional scheduling fields. You never construct this directly — `publish` returns one and `process_messages` hands one to your handler.
+
+```text
+┌──────────────────────────────────────────────────┐
+│                BroccoliQueue                     │
+│  publish() ──► BrokerMessage<T>                  │
+│  process_messages() ──► handler(BrokerMessage<T>)│
+└───────────────────┬──────────────────────────────┘
+                    │ Arc<Box<dyn Broker>>
+        ┌───────────┼───────────────┐
+        ▼           ▼               ▼
+    Redis        RabbitMQ       SurrealDB
+   (bb8-redis) (deadpool-lapin) (surrealdb)
+```
+
+## Feature Flags
+
+Broccoli Queue is built as a collection of optional features so you only compile what you need. Enable them in `Cargo.toml`:
+
+| Feature | Default | Description |
+|---|---|---|
+| `redis` | ✅ yes | Redis broker via `bb8-redis` |
+| `rabbitmq` | no | RabbitMQ broker via `deadpool-lapin` |
+| `surrealdb` | no | SurrealDB broker via the official `surrealdb` crate |
+| `management` | no | Enables `queue_status()` and the management API |
+
+<Note>
+  At least one broker feature must be enabled. If you compile with no broker features, the build will fail with an explicit `compile_error!`. See [Installation](/installation) for the exact `Cargo.toml` snippets.
+</Note>
+
+## Minimal Example
+
+The following snippet shows the complete lifecycle: create a queue, publish a typed message, and process it with an async handler.
+
+```rust
+use broccoli_queue::{
+    brokers::broker::BrokerMessage,
+    error::BroccoliError,
+    queue::BroccoliQueue,
+};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JobPayload {
+    id: String,
+    task_name: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), BroccoliError> {
+    // Build the queue — connects to Redis by default
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .pool_connections(5)
+        .failed_message_retry_strategy(Default::default())
+        .build()
+        .await?;
+
+    // Publish a single typed message
+    queue
+        .publish(
+            "jobs",             // topic / queue name
+            None,               // disambiguator (for fairness queues)
+            &JobPayload {
+                id: "job-1".to_string(),
+                task_name: "process_data".to_string(),
+            },
+            None,               // PublishOptions (TTL, delay, priority)
+        )
+        .await?;
+
+    // Consume and process with 4 concurrent workers
+    queue
+        .process_messages("jobs", Some(4), None, |msg: BrokerMessage<JobPayload>| async move {
+            println!("Processing: {} — {}", msg.payload.id, msg.payload.task_name);
+            Ok(())
+        })
+        .await?;
+
+    Ok(())
+}
+```
+
+## Roadmap
+
+Broccoli Queue is actively developed. Here is the current state of broker and feature support:
+
+| Feature | Status |
+|---|---|
+| Redis broker | ✅ Stable |
+| RabbitMQ broker | ✅ Stable |
+| SurrealDB broker | ✅ Stable |
+| Kafka broker | 🗓 Planned |
+| Proc macros for workers | 🗓 Planned |
+| Web monitoring interface | 🗓 Planned |
+| Additional message patterns | 🗓 Planned |
+
+<Note>
+  Broccoli Queue is not yet 1.0. The API may change between minor versions on the 0.x track. Pin to a specific version in production and review the changelog before upgrading.
+</Note>

@@ -1,0 +1,140 @@
+---
+title: "Inspecting Queue Status with the Management API"
+sidebarTitle: "Management API"
+description: "The management feature flag unlocks queue_status for inspecting pending, processing, and failed message counts. Monitor queue health programmatically from your application."
+---
+
+Broccoli Queue ships a management API that exposes live queue metrics: how many messages are pending, how many are being processed in-flight, and how many have been moved to the failed queue. This information is useful for dashboards, alerting, and autoscaling decisions.
+
+The management API is gated behind a Cargo feature flag so that applications that do not need it do not pay for the additional trait wiring at compile time.
+
+## Enabling the management feature
+
+Add the `management` feature alongside your broker feature in `Cargo.toml`:
+
+```toml
+[dependencies]
+broccoli_queue = { version = "0.4", features = ["redis", "management"] }
+```
+
+## queue_status API
+
+Once the feature is enabled, `BroccoliQueue` gains the `queue_status` method:
+
+```rust
+#[cfg(feature = "management")]
+pub async fn queue_status(
+    &self,
+    queue_name: String,
+    disambiguator: Option<String>,
+) -> Result<QueueStatus, BroccoliError>
+```
+
+Pass the topic name as `queue_name`. For standard queues, leave `disambiguator` as `None`. For fairness queues, pass a specific disambiguator string to query a single tenant's sub-queue, or `None` to aggregate across all disambiguators.
+
+## QueueStatus struct
+
+The returned `QueueStatus` contains all the counts you need for monitoring:
+
+```rust
+pub struct QueueStatus {
+    /// Name of the queue (or disambiguator sub-queue)
+    pub name: String,
+    /// Classification of the queue: Main, Processing, Failed, or Fairness
+    pub queue_type: QueueType,
+    /// Number of messages waiting to be consumed
+    pub size: usize,
+    /// Number of messages currently being processed (in-flight)
+    pub processing: usize,
+    /// Number of messages that exhausted their retry budget
+    pub failed: usize,
+    /// For fairness queues: the number of active disambiguators
+    pub disambiguator_count: Option<usize>,
+}
+```
+
+`QueueType` is an enum with four variants:
+
+```rust
+pub enum QueueType {
+    /// Standard queue without fairness routing
+    Main,
+    /// Messages currently being processed
+    Processing,
+    /// Messages that failed all retry attempts
+    Failed,
+    /// A fairness queue with one or more disambiguator sub-queues
+    Fairness,
+}
+```
+
+## Basic usage
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .pool_connections(5)
+        .build()
+        .await?;
+
+    let status = queue
+        .queue_status("jobs".to_string(), None)
+        .await?;
+
+    println!("Queue:      {}", status.name);
+    println!("Pending:    {}", status.size);
+    println!("Processing: {}", status.processing);
+    println!("Failed:     {}", status.failed);
+
+    Ok(())
+}
+```
+
+## Querying a fairness disambiguator
+
+When working with fairness queues, you can inspect aggregate stats across all disambiguators or drill down into a specific one:
+
+```rust
+// Aggregate stats across all disambiguators for "jobs"
+let all_status = queue
+    .queue_status("jobs".to_string(), None)
+    .await?;
+
+println!(
+    "Total messages across {} disambiguators: {}",
+    all_status.disambiguator_count.unwrap_or(0),
+    all_status.size
+);
+
+// Stats for tenant-a only
+let tenant_status = queue
+    .queue_status("jobs".to_string(), Some("tenant-a".to_string()))
+    .await?;
+
+println!(
+    "tenant-a pending: {}, processing: {}, failed: {}",
+    tenant_status.size,
+    tenant_status.processing,
+    tenant_status.failed
+);
+```
+
+The test suite verifies that querying a non-existent disambiguator returns a zero-count `QueueStatus` rather than an error, so this call is always safe to make without first checking whether the disambiguator exists.
+
+<Note>
+  `queue.size(queue_name)` is available **without** the `management` feature and returns a `HashMap<String, u64>` mapping each sub-queue name to its pending message count. Use it for lightweight size checks when you do not need processing or failed counts:
+
+  ```rust
+  let sizes = queue.size("jobs").await?;
+  for (queue, count) in &sizes {
+      println!("{}: {} messages", queue, count);
+  }
+  ```
+</Note>
+
+<Warning>
+  Passing an **empty string** as `queue_name` to `queue_status` returns a `BroccoliError`. This guard exists to prevent an accidental `KEYS *` scan across the entire Redis key space, which can severely degrade performance on large Redis instances. Always supply an explicit queue name.
+</Warning>

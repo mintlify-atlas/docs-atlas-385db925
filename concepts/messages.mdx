@@ -1,0 +1,140 @@
+---
+title: "Messages and Payloads in Broccoli Queue"
+sidebarTitle: "Messages"
+description: "BrokerMessage<T> is the typed message wrapper in Broccoli Queue. Understand task_id, payload, attempts, disambiguator, and how serialization works with Serde."
+---
+
+Every piece of work that travels through Broccoli Queue is wrapped in a `BrokerMessage<T>`. This generic struct carries your custom payload alongside the metadata the queue system needs to route, track, and retry the message: a unique identifier, an attempt counter, and an optional disambiguator used for fairness scheduling. `BrokerMessage<T>` is what your handler function receives, and it is what `publish` returns so you can record the assigned `task_id` on the caller's side.
+
+## Struct Definition
+
+The struct is defined in `broccoli_queue::brokers::broker`:
+
+```rust
+pub struct BrokerMessage<T: Clone> {
+    pub task_id: uuid::Uuid,
+    pub payload: T,
+    pub attempts: u8,
+    pub disambiguator: Option<String>,
+}
+```
+
+### Field Reference
+
+<ParamField path="task_id" type="uuid::Uuid">
+  A UUIDv4 that uniquely identifies this message across the entire queue.
+  Assigned automatically when `BrokerMessage::new` is called. You can store this
+  value in your own database to correlate a queued job with its outcome.
+</ParamField>
+
+<ParamField path="payload" type="T">
+  Your application-defined data. `T` must implement `Clone`, `serde::Serialize`,
+  and `serde::de::DeserializeOwned`. The payload is serialized to JSON by
+  `serde_json` before being stored in the broker.
+</ParamField>
+
+<ParamField path="attempts" type="u8">
+  The number of times this message has been processed. Starts at `0` when the
+  message is first published and is incremented each time the message is
+  rejected and re-queued. Inspect this field inside your handler to implement
+  escalating back-off logic or to log repeated failures.
+</ParamField>
+
+<ParamField path="disambiguator" type="Option<String>">
+  An optional string used to partition messages into per-disambiguator fairness
+  queues (Redis only). When set, messages with the same disambiguator are
+  processed in order relative to each other, preventing one producer from
+  starving all others. Pass `None` for standard FIFO behavior.
+</ParamField>
+
+## Type Constraints
+
+The generic parameter `T` must satisfy the following bounds wherever a `BrokerMessage<T>` is published or consumed:
+
+```rust
+T: Clone + serde::Serialize + serde::de::DeserializeOwned
+```
+
+Any struct that derives `Clone`, `Serialize`, and `Deserialize` from `serde` satisfies these bounds automatically.
+
+## Defining a Message Payload
+
+Annotate your payload type with the standard Serde and Clone derives:
+
+```rust
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EmailJob {
+    recipient: String,
+    subject: String,
+    body: String,
+}
+```
+
+Publishing and consuming `EmailJob` values then looks like this:
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+use broccoli_queue::error::BroccoliError;
+use broccoli_queue::brokers::broker::BrokerMessage;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .failed_message_retry_strategy(Default::default())
+        .build()
+        .await?;
+
+    // Publish — returns the BrokerMessage with its assigned task_id
+    let job = EmailJob {
+        recipient: "user@example.com".into(),
+        subject: "Welcome!".into(),
+        body: "Thanks for signing up.".into(),
+    };
+
+    let published = queue.publish("emails", None, &job, None).await?;
+    println!("Enqueued task_id: {}", published.task_id);
+
+    // Consume and process
+    queue
+        .process_messages::<EmailJob, _, _>("emails", None, None, |msg: BrokerMessage<EmailJob>| async move {
+            println!(
+                "Attempt #{} — sending to {}",
+                msg.attempts, msg.payload.recipient
+            );
+            Ok(())
+        })
+        .await?;
+
+    Ok(())
+}
+```
+
+## Serialization
+
+Broccoli Queue serializes the payload to a JSON string using `serde_json::to_string` before writing it to the broker, and deserializes it back with `serde_json::from_str` on consumption. This means:
+
+- All field types in `T` must be JSON-compatible.
+- `serde` attributes like `#[serde(rename = "...")]` and `#[serde(skip)]` work as expected.
+- Enum variants, nested structs, and `Option` fields are fully supported.
+
+<Note>
+  `task_id` is assigned inside `BrokerMessage::new()`, which is called
+  automatically by `BroccoliQueue::publish`. Each call to `publish` produces a
+  fresh UUIDv4, so even identical payloads will have distinct identifiers.
+</Note>
+
+## Retry Tracking via `attempts`
+
+After a message is rejected (because its handler returned `Err(...)`), the broker increments `attempts` before re-queuing the message. When your handler receives a re-delivered message, `msg.attempts` tells you exactly how many previous failures occurred. This allows you to apply custom logic — such as switching to a fallback delivery provider on attempt 2 or sending an alert on attempt 3.
+
+```rust
+|msg: BrokerMessage<EmailJob>| async move {
+    if msg.attempts >= 2 {
+        // Last-chance logic before the message hits the failed queue
+        eprintln!("Message {} has failed {} times", msg.task_id, msg.attempts);
+    }
+    send_email(&msg.payload).await.map_err(|e| BroccoliError::Job(e.to_string()))
+}
+```

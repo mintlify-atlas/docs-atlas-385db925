@@ -1,0 +1,116 @@
+---
+title: "InternalBrokerMessage: Serialized Message Format"
+sidebarTitle: "InternalBrokerMessage"
+description: "InternalBrokerMessage is the serialized wire format used internally by Broccoli Queue brokers. Understanding it helps when implementing custom broker backends."
+---
+
+`InternalBrokerMessage` is the internal serialized representation that broker implementations use to transport messages over the wire and store them in the underlying backend (Redis, RabbitMQ, SurrealDB, or a custom store). It holds the same logical fields as `BrokerMessage<T>`, but with `task_id` as a plain `String` and `payload` as a JSON-serialized `String` rather than a strongly typed value. Most application code never needs to construct or inspect this type directly — it surfaces only when implementing the `Broker` trait.
+
+## Struct Definition
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InternalBrokerMessage {
+    pub task_id: String,
+    pub payload: String,  // JSON-serialized T
+    pub attempts: u8,
+    pub disambiguator: Option<String>,
+}
+```
+
+## Fields
+
+<ParamField path="task_id" type="String" required>
+  The string representation of the original `uuid::Uuid` task identifier. Stored as a plain `String` so it can be serialized to any backend without a UUID dependency.
+</ParamField>
+
+<ParamField path="payload" type="String" required>
+  The message payload serialized to a JSON string via `serde_json::to_string`. The concrete type is erased at this layer; consumers call `into_message::<T>()` to recover the typed value.
+</ParamField>
+
+<ParamField path="attempts" type="u8" required>
+  Number of processing attempts made. Carried through unchanged from `BrokerMessage<T>` and incremented by the broker on each rejection before re-queuing.
+</ParamField>
+
+<ParamField path="disambiguator" type="Option<String>">
+  Optional fairness group identifier, forwarded from the originating `BrokerMessage<T>`. The broker uses this to route the message to the correct fairness sub-queue.
+</ParamField>
+
+## Constructor
+
+```rust
+impl InternalBrokerMessage {
+    #[must_use]
+    pub const fn new(
+        task_id: String,
+        payload: String,
+        attempts: u8,
+        disambiguator: Option<String>,
+    ) -> Self
+}
+```
+
+Constructs an `InternalBrokerMessage` directly from its constituent parts. Primarily used inside broker backend implementations when reading a raw message from the underlying store and rehydrating it into the Broccoli internal format.
+
+## Converting to a Typed Message
+
+Once an `InternalBrokerMessage` has been retrieved from the broker, call `into_message::<T>()` to deserialize the payload back into a strongly typed `BrokerMessage<T>`:
+
+```rust
+pub fn into_message<T: Clone + DeserializeOwned + Serialize>(
+    &self,
+) -> Result<BrokerMessage<T>, BroccoliError>
+```
+
+This method:
+1. Parses `task_id` back into a `uuid::Uuid` (falling back to the default UUID on parse failure).
+2. Deserializes `payload` from JSON into `T`, returning `BroccoliError::Broker` if the JSON is malformed or the types do not match.
+3. Reconstructs the full `BrokerMessage<T>` with `attempts` and `disambiguator` intact.
+
+## Converting from a Typed Message
+
+Conversion from `BrokerMessage<T>` into `InternalBrokerMessage` is handled automatically via the `From` trait — both owned and borrowed forms are supported:
+
+```rust
+// Owned conversion
+let internal: InternalBrokerMessage = broker_message.into();
+
+// Borrowed conversion (clones disambiguator)
+let internal: InternalBrokerMessage = (&broker_message).into();
+```
+
+The `payload` field is produced by `serde_json::to_string(&msg.payload)`, falling back to an empty string if serialization fails. In practice, the type bounds on `BrokerMessage<T>` guarantee serialization will succeed.
+
+## Round-Trip Example
+
+The following illustrates how `BrokerMessage<T>` and `InternalBrokerMessage` relate in a typical broker flow:
+
+```rust
+use broccoli_queue::brokers::broker::{BrokerMessage, InternalBrokerMessage};
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct OrderEvent {
+    order_id: u64,
+    status: String,
+}
+
+// Publish side: typed → internal
+let typed = BrokerMessage::new(
+    OrderEvent { order_id: 42, status: "confirmed".into() },
+    None,
+);
+let internal: InternalBrokerMessage = typed.into();
+// internal.payload == r#"{"order_id":42,"status":"confirmed"}"#
+
+// Consume side: internal → typed
+let recovered: BrokerMessage<OrderEvent> = internal.into_message()?;
+assert_eq!(recovered.payload.order_id, 42);
+```
+
+<Note>
+  `InternalBrokerMessage` is primarily used when implementing the `Broker` trait. If you are consuming or publishing messages through `BroccoliQueue`, you will work exclusively with `BrokerMessage<T>` and never need to construct or inspect `InternalBrokerMessage` manually.
+</Note>
+
+<Tip>
+  Building a custom broker backend? See the [Broker Trait](/api/broker-trait) reference for the full interface your implementation must satisfy, including how `InternalBrokerMessage` is passed through each method.
+</Tip>

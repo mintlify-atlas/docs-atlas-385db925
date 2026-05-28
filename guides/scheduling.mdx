@@ -1,0 +1,203 @@
+---
+title: "Scheduling and Delaying Messages in Broccoli Queue"
+sidebarTitle: "Scheduling"
+description: "Delay messages by a duration or schedule them at a precise timestamp using PublishOptions. Requires enable_scheduling on the queue builder. RabbitMQ needs the delayed-exchange plugin."
+---
+
+Broccoli Queue supports two scheduling strategies: a **relative delay** that makes a message visible after a given duration has elapsed, and an **absolute schedule** that pins delivery to a specific UTC timestamp. Both strategies are expressed through `PublishOptions` and work identically across the Redis and SurrealDB brokers.
+
+Scheduling is an optional capability — it is disabled by default to avoid any overhead on queues that do not need it.
+
+## Enabling scheduling on the builder
+
+Add `.enable_scheduling(true)` when constructing the queue. If this is omitted, delay and `scheduled_at` options are silently ignored.
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .enable_scheduling(true)
+    .pool_connections(5)
+    .build()
+    .await?;
+```
+
+<Note>
+  If `enable_scheduling` is not set to `true`, publishing with a `delay` or `scheduled_at` value has no effect — the message is delivered immediately as if no scheduling option was provided.
+</Note>
+
+## Delay by duration
+
+Use `PublishOptions::delay` to hold a message in the queue for a fixed duration before it becomes visible to consumers. The duration is relative to the time `publish` is called.
+
+<Tabs>
+  <Tab title="Struct literal">
+    ```rust
+    use broccoli_queue::queue::{BroccoliQueue, PublishOptions};
+    use time::Duration;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct JobPayload { id: String }
+
+    #[tokio::main]
+    async fn main() -> Result<(), Box<dyn std::error::Error>> {
+        let queue = BroccoliQueue::builder("redis://localhost:6379")
+            .enable_scheduling(true)
+            .build()
+            .await?;
+
+        let job = JobPayload { id: "job-1".to_string() };
+
+        // The message will not be visible to consumers for 30 seconds
+        queue
+            .publish(
+                "jobs",
+                None,
+                &job,
+                Some(PublishOptions {
+                    delay: Some(Duration::seconds(30)),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+
+        Ok(())
+    }
+    ```
+  </Tab>
+  <Tab title="Builder pattern">
+    ```rust
+    use broccoli_queue::queue::{BroccoliQueue, PublishOptions};
+    use time::Duration;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct JobPayload { id: String }
+
+    #[tokio::main]
+    async fn main() -> Result<(), Box<dyn std::error::Error>> {
+        let queue = BroccoliQueue::builder("redis://localhost:6379")
+            .enable_scheduling(true)
+            .build()
+            .await?;
+
+        let job = JobPayload { id: "job-1".to_string() };
+
+        let opts = PublishOptions::builder()
+            .delay(Duration::seconds(30))
+            .build();
+
+        queue.publish("jobs", None, &job, Some(opts)).await?;
+
+        Ok(())
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Schedule at an exact timestamp
+
+Use `PublishOptions::scheduled_at` to specify the exact UTC moment at which a message becomes visible. This is useful for cron-style or calendar-driven workflows.
+
+<Tabs>
+  <Tab title="Struct literal">
+    ```rust
+    use broccoli_queue::queue::{BroccoliQueue, PublishOptions};
+    use time::{Duration, OffsetDateTime};
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct JobPayload { id: String }
+
+    #[tokio::main]
+    async fn main() -> Result<(), Box<dyn std::error::Error>> {
+        let queue = BroccoliQueue::builder("redis://localhost:6379")
+            .enable_scheduling(true)
+            .build()
+            .await?;
+
+        let job = JobPayload { id: "job-1".to_string() };
+
+        // Schedule for exactly 24 hours from now
+        let tomorrow = OffsetDateTime::now_utc() + Duration::days(1);
+
+        queue
+            .publish(
+                "jobs",
+                None,
+                &job,
+                Some(PublishOptions {
+                    scheduled_at: Some(tomorrow),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+
+        Ok(())
+    }
+    ```
+  </Tab>
+  <Tab title="Builder pattern">
+    ```rust
+    use broccoli_queue::queue::{BroccoliQueue, PublishOptions};
+    use time::{Duration, OffsetDateTime};
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct JobPayload { id: String }
+
+    #[tokio::main]
+    async fn main() -> Result<(), Box<dyn std::error::Error>> {
+        let queue = BroccoliQueue::builder("redis://localhost:6379")
+            .enable_scheduling(true)
+            .build()
+            .await?;
+
+        let job = JobPayload { id: "job-1".to_string() };
+
+        let tomorrow = OffsetDateTime::now_utc() + Duration::days(1);
+
+        let opts = PublishOptions::builder()
+            .schedule_at(tomorrow)
+            .build();
+
+        queue.publish("jobs", None, &job, Some(opts)).await?;
+
+        Ok(())
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Combining scheduling with priority
+
+You can set both a scheduling option and a priority in the same `PublishOptions`. The message will be sorted by priority within the window of messages that become visible at the same time.
+
+```rust
+use broccoli_queue::queue::PublishOptions;
+use time::Duration;
+
+let opts = PublishOptions::builder()
+    .delay(Duration::seconds(60))
+    .priority(2)
+    .build();
+```
+
+## Message TTL
+
+Set `ttl` to automatically discard a message if it has not been consumed within a given duration from the time it was published. This prevents stale jobs from piling up in the queue.
+
+```rust
+use broccoli_queue::queue::PublishOptions;
+use time::Duration;
+
+let opts = PublishOptions {
+    ttl: Some(Duration::minutes(10)),
+    ..Default::default()
+};
+```
+
+<Warning>
+  If you use **RabbitMQ** as your broker, scheduling requires installing the [`rabbitmq_delayed_message_exchange`](https://www.rabbitmq.com/blog/2015/04/16/scheduling-messages-with-rabbitmq) plugin on every broker node before calling `.enable_scheduling(true)`. Without the plugin the broker will reject the exchange declaration and return a connection error.
+</Warning>

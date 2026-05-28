@@ -1,0 +1,172 @@
+---
+title: "Install Broccoli Queue in Your Rust Project"
+sidebarTitle: "Installation"
+description: "Add broccoli_queue to Cargo.toml with the right feature flags for Redis, RabbitMQ, or SurrealDB. Covers version pinning and the optional management API."
+---
+
+Broccoli Queue is published on [crates.io](https://crates.io/crates/broccoli_queue) as `broccoli_queue`. Because it supports multiple broker backends through Cargo feature flags, the exact `Cargo.toml` entry depends on which broker you want to use. Redis is the default and requires no extra configuration; RabbitMQ and SurrealDB require you to opt in with explicit features and disable the default ones if you want to avoid compiling unused dependencies.
+
+<Note>
+  At least one broker feature (`redis`, `rabbitmq`, or `surrealdb`) must be enabled. If you compile without any broker feature, the build will fail immediately with a `compile_error!`. This is intentional — Broccoli Queue has no built-in fallback broker.
+</Note>
+
+## Choose Your Broker
+
+<Tabs>
+  <Tab title="Redis (default)">
+    Redis is the default broker and requires no `features` key. Add the crate and you are done:
+
+    ```toml
+    [dependencies]
+    broccoli_queue = "0.4"
+    tokio = { version = "1", features = ["full"] }
+    serde = { version = "1", features = ["derive"] }
+    ```
+
+    Connect with a standard Redis URL:
+
+    ```rust
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .pool_connections(5)
+        .failed_message_retry_strategy(Default::default())
+        .build()
+        .await?;
+    ```
+
+    The Redis broker uses [`bb8-redis`](https://crates.io/crates/bb8-redis) for async connection pooling and supports TLS via `rediss://` URLs with the `tokio-rustls-comp` backend.
+  </Tab>
+
+  <Tab title="RabbitMQ">
+    To use RabbitMQ, disable the default `redis` feature and enable `rabbitmq`:
+
+    ```toml
+    [dependencies]
+    broccoli_queue = { version = "0.4", features = ["rabbitmq"], default-features = false }
+    tokio = { version = "1", features = ["full"] }
+    serde = { version = "1", features = ["derive"] }
+    ```
+
+    Connect with a standard AMQP URL:
+
+    ```rust
+    let queue = BroccoliQueue::builder("amqp://localhost:5672")
+        .pool_connections(5)
+        .failed_message_retry_strategy(Default::default())
+        .build()
+        .await?;
+    ```
+
+    The RabbitMQ broker uses [`deadpool-lapin`](https://crates.io/crates/deadpool-lapin) for connection pooling. If you enable message scheduling (`enable_scheduling(true)`) with RabbitMQ, you must also install the [RabbitMQ delayed message exchange plugin](https://www.rabbitmq.com/blog/2015/04/16/scheduling-messages-with-rabbitmq).
+  </Tab>
+
+  <Tab title="SurrealDB">
+    To use SurrealDB, disable the default `redis` feature and enable `surrealdb`:
+
+    ```toml
+    [dependencies]
+    broccoli_queue = { version = "0.4", features = ["surrealdb"], default-features = false }
+    tokio = { version = "1", features = ["full"] }
+    serde = { version = "1", features = ["derive"] }
+    ```
+
+    Connect with a WebSocket URL pointing to your SurrealDB instance:
+
+    ```rust
+    let queue = BroccoliQueue::builder("ws://localhost:8000")
+        .pool_connections(5)
+        .failed_message_retry_strategy(Default::default())
+        .build()
+        .await?;
+    ```
+
+    Alternatively, if you already have an open `surrealdb::Surreal` connection in your application, you can reuse it:
+
+    ```rust
+    use broccoli_queue::queue::BroccoliQueue;
+    use surrealdb::engine::any::connect;
+
+    let db = connect("ws://localhost:8000").await?;
+    // ... authenticate, use_ns / use_db, etc.
+
+    let queue = BroccoliQueue::builder_with(db)
+        .failed_message_retry_strategy(Default::default())
+        .build()
+        .await?;
+    ```
+
+    The SurrealDB broker uses the official [`surrealdb`](https://crates.io/crates/surrealdb) crate and stores messages as records in SurrealDB tables.
+  </Tab>
+
+  <Tab title="All Features">
+    To compile support for every broker at once — useful for libraries or integration test suites — enable all features together:
+
+    ```toml
+    [dependencies]
+    broccoli_queue = { version = "0.4", features = ["redis", "rabbitmq", "surrealdb", "management"] }
+    tokio = { version = "1", features = ["full"] }
+    serde = { version = "1", features = ["derive"] }
+    ```
+
+    At runtime, the broker is selected by the URL scheme you pass to `BroccoliQueue::builder`: `redis://`, `rediss://`, `amqp://`, `amqps://`, or `ws://` / `wss://`.
+  </Tab>
+</Tabs>
+
+## Feature Flag Reference
+
+<ParamField path="redis" type="feature flag" default="enabled">
+  Enables the Redis broker backend via [`bb8-redis`](https://crates.io/crates/bb8-redis) and the [`redis`](https://crates.io/crates/redis) crate. Supports `redis://` and `rediss://` (TLS) URLs. This is the default feature — you must set `default-features = false` to exclude it.
+</ParamField>
+
+<ParamField path="rabbitmq" type="feature flag" default="disabled">
+  Enables the RabbitMQ broker backend via [`deadpool-lapin`](https://crates.io/crates/deadpool-lapin) and [`lapin`](https://crates.io/crates/lapin). Supports `amqp://` and `amqps://` (TLS) URLs. Requires `default-features = false` if you do not also want Redis compiled in.
+</ParamField>
+
+<ParamField path="surrealdb" type="feature flag" default="disabled">
+  Enables the SurrealDB broker backend via the official [`surrealdb`](https://crates.io/crates/surrealdb) crate (version 2.x). Supports `ws://` and `wss://` URLs, and also exposes `BroccoliQueue::builder_with(db)` for passing an existing connection. Requires `default-features = false` if you do not also want Redis.
+</ParamField>
+
+<ParamField path="management" type="feature flag" default="disabled">
+  Enables the `queue_status()` method on `BroccoliQueue`, which returns a `QueueStatus` snapshot (pending count, processing count, failed count) for a given topic. Uses [`derive_more`](https://crates.io/crates/derive_more) internally. Can be combined with any broker feature.
+</ParamField>
+
+## Required Dependencies
+
+Regardless of which broker you choose, you will always need these crates in your project:
+
+```toml
+[dependencies]
+# Async runtime — tokio::main and task spawning
+tokio = { version = "1", features = ["full"] }
+
+# Serialization — all message payloads must implement Serialize + DeserializeOwned
+serde = { version = "1", features = ["derive"] }
+```
+
+If your message types include timestamps (as in the publisher/consumer examples), also add:
+
+```toml
+# Optional — only needed if your payload structs use chrono types
+chrono = { version = "0.4", features = ["serde"] }
+```
+
+## Version Pinning
+
+The crate follows [Semantic Versioning](https://semver.org/). While the project is on the `0.x` track, minor version bumps may include breaking API changes. For production services, pin to the patch version:
+
+```toml
+[dependencies]
+broccoli_queue = "=0.4.6"
+```
+
+Check the [crates.io version history](https://crates.io/crates/broccoli_queue/versions) or the [GitHub releases](https://github.com/densumesh/broccoli/releases) page before upgrading.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Publish your first message and run a live consumer in under five minutes.
+  </Card>
+  <Card title="Redis Broker" icon="database" href="/brokers/redis">
+    Learn connection pooling, TLS, fairness queues, and Redis-specific options.
+  </Card>
+</CardGroup>

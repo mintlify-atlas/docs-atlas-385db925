@@ -1,0 +1,128 @@
+---
+title: "Understanding the BroccoliQueue: Rust Job Queue Core"
+sidebarTitle: "Queue"
+description: "The BroccoliQueue struct is the central interface for publishing, consuming, and processing messages. Learn how it wraps broker implementations and manages workers."
+---
+
+`BroccoliQueue` is the primary entry point for every interaction with the message queue. It wraps a pluggable broker backend — Redis, RabbitMQ, or SurrealDB — behind a single, uniform async API. Once built, a `BroccoliQueue` instance lets you publish messages to named topics, consume them individually or in batches, acknowledge successful processing, reject failures, and run long-lived worker loops with configurable concurrency. Because all I/O goes through an internally managed connection pool, you never have to juggle raw connections yourself.
+
+## Building a Queue
+
+`BroccoliQueue` is constructed through a builder that accepts a broker URL and optional tuning parameters. Call `BroccoliQueue::builder` with your broker URL, chain configuration methods, then call the async `.build()` method:
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, RetryStrategy};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .pool_connections(5)
+        .failed_message_retry_strategy(Default::default())
+        .enable_scheduling(false)
+        .build()
+        .await?;
+
+    Ok(())
+}
+```
+
+### Builder Options
+
+<ParamField path="pool_connections" type="u8">
+  Number of connections to maintain in the broker's connection pool. A higher
+  value increases throughput under concurrent workloads. Defaults to `10`.
+</ParamField>
+
+<ParamField path="failed_message_retry_strategy" type="RetryStrategy">
+  Controls how many times a failed message is re-queued before it is moved to
+  the permanent failed queue. Accepts a `RetryStrategy` value; use
+  `Default::default()` for 3 attempts with retries enabled. See the [Retry
+  Strategy](/concepts/retry-strategy) page for full details.
+</ParamField>
+
+<ParamField path="enable_scheduling" type="bool">
+  When `true`, messages may be published with a `delay` or `scheduled_at` time
+  via `PublishOptions`. Defaults to `false`. If you enable scheduling with
+  RabbitMQ, the
+  [rabbitmq-delayed-message-exchange](https://www.rabbitmq.com/blog/2015/04/16/scheduling-messages-with-rabbitmq)
+  plugin must be installed on your broker.
+</ParamField>
+
+## Cloning and Sharing a Queue
+
+`BroccoliQueue` implements `Clone`. Under the hood, the broker connection pool is stored in an `Arc`, so every clone shares the exact same pool — no extra connections are opened.
+
+<Note>
+  Calling `BroccoliQueue::clone()` does **not** create a new connection pool. All
+  clones reference the same underlying broker connection via `Arc::clone`, making
+  it cheap to hand a queue handle to multiple Tokio tasks.
+</Note>
+
+This makes it straightforward to share one queue across many concurrent workers:
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+use broccoli_queue::error::BroccoliError;
+use broccoli_queue::brokers::broker::BrokerMessage;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct EmailJob {
+    recipient: String,
+    subject: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .pool_connections(5)
+        .failed_message_retry_strategy(Default::default())
+        .build()
+        .await?;
+
+    // Clone is cheap — both handles share the same pool.
+    let queue_worker_a = queue.clone();
+    let queue_worker_b = queue.clone();
+
+    let handle_a = tokio::spawn(async move {
+        queue_worker_a
+            .process_messages::<EmailJob, _, _>("emails", None, None, |msg| async move {
+                println!("Worker A handling: {}", msg.payload.recipient);
+                Ok(())
+            })
+            .await
+    });
+
+    let handle_b = tokio::spawn(async move {
+        queue_worker_b
+            .process_messages::<EmailJob, _, _>("emails", None, None, |msg| async move {
+                println!("Worker B handling: {}", msg.payload.recipient);
+                Ok(())
+            })
+            .await
+    });
+
+    let _ = tokio::join!(handle_a, handle_b);
+    Ok(())
+}
+```
+
+## Topics Map to Queue Names
+
+Every `publish`, `consume`, and `process_messages` call accepts a `topic: &str` argument. This string maps directly to the queue or channel name in the underlying broker — for example, a Redis list key or a RabbitMQ queue name. Choose topic names that are descriptive and stable, since changing them requires migrating any messages already in flight.
+
+## Core Methods at a Glance
+
+| Method | Description |
+|---|---|
+| `publish` | Send a single message to a topic |
+| `publish_batch` | Send multiple messages in one call |
+| `consume` | Block until one message is available |
+| `try_consume` | Non-blocking poll; returns `None` immediately if empty |
+| `consume_batch` | Block until N messages arrive or a timeout expires |
+| `try_consume_batch` | Non-blocking poll for up to N messages |
+| `acknowledge` | Mark a message as successfully processed |
+| `reject` | Mark a message as failed, triggering retry logic |
+| `cancel` | Delete a message from the queue entirely |
+| `process_messages` | Run a blocking worker loop with an async handler |
+| `process_messages_with_handlers` | Worker loop with separate success and error callbacks |
+| `size` | Return the current depth of a queue |

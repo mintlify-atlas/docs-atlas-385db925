@@ -1,0 +1,167 @@
+---
+title: "Configuring Retry Strategies for Failed Messages"
+sidebarTitle: "Retry Strategy"
+description: "RetryStrategy controls how Broccoli Queue handles failed messages: number of attempts, whether to retry, and routing to the failed queue after max attempts."
+---
+
+When a message handler returns an error, Broccoli Queue does not discard the message silently. Instead, it follows a configurable retry lifecycle: the message is rejected back to the broker, the attempt counter is incremented, and — depending on your `RetryStrategy` — the message is either re-queued for another attempt or moved permanently to a dedicated failed queue named `{topic}_failed`. This gives you a predictable safety net for transient failures while ensuring that persistently bad messages do not loop forever.
+
+## Retry Lifecycle
+
+<Steps>
+  <Step title="Handler returns Err(...)">
+    Your message handler signals failure by returning any `Err` variant.
+    `BroccoliQueue` calls `broker.reject()` on the message automatically.
+  </Step>
+  <Step title="Attempt counter incremented">
+    The broker increments the `attempts` field on the `BrokerMessage` and checks
+    it against the configured maximum.
+  </Step>
+  <Step title="Re-queue or fail">
+    If `attempts` is still below the maximum, the message is placed back on the
+    original topic queue and will be delivered to a worker again. If `attempts`
+    has reached the maximum, the message is moved to `{topic}_failed`.
+  </Step>
+</Steps>
+
+## The `RetryStrategy` Struct
+
+`RetryStrategy` is defined in `broccoli_queue::queue`:
+
+```rust
+pub struct RetryStrategy {
+    /// Whether failed messages should be retried. Default: true
+    pub retry_failed: bool,
+    /// Maximum number of retry attempts. Default: Some(3)
+    pub attempts: Option<u8>,
+}
+```
+
+The `Default` implementation provides a sensible starting point — three attempts with retries enabled:
+
+```rust
+impl Default for RetryStrategy {
+    fn default() -> Self {
+        Self {
+            retry_failed: true,
+            attempts: Some(3),
+        }
+    }
+}
+```
+
+## Builder API
+
+`RetryStrategy` exposes a fluent builder so you can compose a custom strategy without constructing the struct directly:
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, RetryStrategy};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let strategy = RetryStrategy::new()
+        .with_attempts(5)
+        .retry_failed(true);
+
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .failed_message_retry_strategy(strategy)
+        .build()
+        .await?;
+
+    Ok(())
+}
+```
+
+### Builder Methods
+
+<ParamField path="with_attempts" type="u8">
+  Sets the maximum number of delivery attempts before the message is routed to
+  the `{topic}_failed` queue. Must be a `u8` (0–255). A value of `1` means the
+  message is tried once and immediately moved to the failed queue if it errors.
+</ParamField>
+
+<ParamField path="retry_failed" type="bool">
+  Controls whether failed messages are re-queued at all. When `true` (the
+  default), messages cycle through the retry loop up to the `attempts` limit.
+  When `false`, any failure immediately routes the message to `{topic}_failed`
+  regardless of the `attempts` setting.
+</ParamField>
+
+<Warning>
+  Setting `retry_failed = false` bypasses all retry logic. The very first
+  handler error will move the message to `{topic}_failed`. Use this only when
+  you want a strict at-most-once delivery guarantee and have a separate
+  reconciliation process for the failed queue.
+</Warning>
+
+## Using the Default Strategy
+
+For most workloads the default three-attempt strategy is sufficient. Pass `Default::default()` to `failed_message_retry_strategy`:
+
+```rust
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .failed_message_retry_strategy(Default::default())
+    .build()
+    .await?;
+```
+
+## Handler Errors and `BroccoliError::Job`
+
+Your handler should return `Result<(), BroccoliError>`. Use the `BroccoliError::Job(String)` variant to signal a domain-level processing failure:
+
+```rust
+use broccoli_queue::error::BroccoliError;
+use broccoli_queue::brokers::broker::BrokerMessage;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct OrderJob {
+    order_id: u64,
+}
+
+async fn handle_order(msg: BrokerMessage<OrderJob>) -> Result<(), BroccoliError> {
+    process_order(msg.payload.order_id)
+        .await
+        .map_err(|e| BroccoliError::Job(format!("Order {} failed: {}", msg.payload.order_id, e)))
+}
+```
+
+When `handle_order` returns `Err(BroccoliError::Job(...))`, the queue logs the error, rejects the message, and — if `retry_failed` is `true` and attempts remain — re-queues it for another worker to pick up.
+
+## Inspecting Attempts in Your Handler
+
+<Tip>
+  The `attempts` field on `BrokerMessage` reflects how many times the message
+  has already been tried. Use it to implement escalating behaviour — for example,
+  switching to a slower but more reliable code path on attempt 2, or emitting a
+  metric alert when the message is on its final attempt.
+</Tip>
+
+```rust
+async fn handle_order(msg: BrokerMessage<OrderJob>) -> Result<(), BroccoliError> {
+    match msg.attempts {
+        0 => fast_path(&msg.payload).await,
+        1 => slow_path(&msg.payload).await,
+        n => {
+            eprintln!(
+                "Order {} has failed {} times — escalating",
+                msg.payload.order_id, n
+            );
+            escalate(&msg.payload).await
+        }
+    }
+    .map_err(|e| BroccoliError::Job(e.to_string()))
+}
+```
+
+## Failed Queue
+
+Messages that exhaust all retry attempts are moved to a queue named `{topic}_failed`. You can monitor this queue with `BroccoliQueue::size`, consume from it with `BroccoliQueue::consume`, or process it with a dedicated worker using `BroccoliQueue::process_messages` pointed at the `"{topic}_failed"` topic name.
+
+```rust
+// Check how many messages are permanently failed
+let counts = queue.size("orders_failed").await?;
+println!("Failed order count: {:?}", counts);
+
+// Consume from the failed queue for manual inspection
+let failed_msg = queue.try_consume::<OrderJob>("orders_failed", None).await?;
+```

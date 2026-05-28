@@ -1,0 +1,132 @@
+---
+title: "Using SurrealDB as a Broccoli Queue Broker Backend"
+sidebarTitle: "SurrealDB"
+description: "Configure Broccoli Queue with a SurrealDB backend for embedded or remote queue storage. Supports WebSocket and in-memory connections. Requires the surrealdb feature flag."
+---
+
+The SurrealDB backend stores queue state directly inside a [SurrealDB](https://surrealdb.com) database, making it a natural fit when your application already runs SurrealDB or when you want a self-contained, embedded queue with no additional infrastructure. It supports both a remote WebSocket server and an in-memory engine, the latter being ideal for tests or local development. Blocking consumption is implemented using SurrealDB's **live queries**, so idle consumers do not poll — they are notified the moment a new message arrives.
+
+## Feature Flag
+
+The `surrealdb` feature is **not** enabled by default. Add it explicitly:
+
+```toml
+[dependencies]
+broccoli_queue = { version = "0.4", features = ["surrealdb"], default-features = false }
+```
+
+The `kv-mem` SurrealDB feature is included automatically, which enables the in-memory engine for testing.
+
+## Connection URL Format
+
+<Tabs>
+  <Tab title="Remote WebSocket">
+    Connect to a running SurrealDB server over WebSocket. Namespace, database, and credentials are provided as query parameters:
+
+    ```
+    ws://host:port?ns=myns&db=mydb&username=root&password=root
+    ```
+
+    | Parameter | Required | Description |
+    |---|---|---|
+    | `ns` | Yes | SurrealDB namespace |
+    | `db` | Yes | SurrealDB database |
+    | `username` | Yes | Authentication username |
+    | `password` | Yes | Authentication password |
+
+    If any parameter is omitted, Broccoli Queue falls back to `root` / `root` / `test` / `test` defaults — **only suitable for local development**.
+  </Tab>
+  <Tab title="In-Memory (Testing)">
+    Use the `mem://` scheme to spin up an embedded in-memory SurrealDB instance. No server is required, and the data is discarded when the process exits:
+
+    ```
+    mem://
+    ```
+  </Tab>
+</Tabs>
+
+## Connecting via URL
+
+```rust
+let queue = BroccoliQueue::builder(
+    "ws://localhost:8000?ns=myns&db=mydb&username=root&password=root"
+)
+.build()
+.await?;
+```
+
+The URL is parsed to extract query parameters. Broccoli Queue then calls `surrealdb::engine::any::connect` and signs in with the provided credentials before marking the broker as connected.
+
+## Providing an Existing SurrealDB Connection
+
+If your application already maintains a `Surreal<Any>` client, you can hand it directly to Broccoli Queue using `builder_with`. This avoids opening a second connection and lets you share the same database session across your application and the queue:
+
+```rust
+use surrealdb::{engine::any::Any, Surreal};
+
+let db: Surreal<Any> = /* your existing connection */;
+let queue = BroccoliQueue::builder_with(db)
+    .build()
+    .await?;
+```
+
+When a `surrealdb_connection` is present in the `BrokerConfig`, it takes precedence over any URL passed to `builder`.
+
+## Starting SurrealDB with Docker
+
+```bash
+docker run -p 8000:8000 surrealdb/surrealdb:latest start
+```
+
+## In-Memory Usage for Testing
+
+```rust
+let queue = BroccoliQueue::builder("mem://")
+    .build()
+    .await?;
+```
+
+Because the in-memory engine is embedded in the process, there is no network round-trip and no server to manage. Each call to `builder("mem://")` creates a fresh, isolated database, making it safe to use in parallel tests.
+
+## Internal Schema
+
+Broccoli Queue creates the following SurrealDB tables for each topic. All tables are named after the topic with a suffix:
+
+<CardGroup cols={2}>
+  <Card title="Message Table" icon="envelope" href="https://surrealdb.com/docs/surrealql/statements/define/table">
+    One record per message, keyed by `{queue_name}:{task_id}`. Stores `task_id`, `payload`, and `attempts`.
+  </Card>
+  <Card title="Queue Entry Table" icon="layer-group" href="https://surrealdb.com/docs/surrealql/statements/define/table">
+    One record per queued message, keyed by `{queue_name}_queue:[priority, timestamp, task_id]`. Stores `message_id`, `priority`, and `timestamp` for ordering.
+  </Card>
+  <Card title="Processing Table" icon="spinner" href="https://surrealdb.com/docs/surrealql/statements/define/table">
+    Tracks messages currently being processed. Records are removed on `acknowledge` and either re-enqueued or moved to failed on `reject`.
+  </Card>
+  <Card title="Failed Table" icon="circle-xmark" href="https://surrealdb.com/docs/surrealql/statements/define/table">
+    Holds messages that have exceeded the configured retry limit, along with the original message content and a timestamp.
+  </Card>
+</CardGroup>
+
+### Priority and Ordering
+
+Messages are ordered by composing the record key as `[priority, timestamp, task_id]`. SurrealDB's native key ordering means lower priority numbers and earlier timestamps sort first, without requiring a secondary index. Consumption retrieves the entry with the lowest such key.
+
+### Scheduling
+
+When `enable_scheduling` is set and a `delay` or `scheduled_at` is provided, the queue entry stores a future timestamp as its ordering key. The consume query filters entries by `timestamp <= time::now()`, so scheduled messages are invisible until their time arrives.
+
+## Concurrency and Idempotency
+
+<Note>
+Concurrent consumers on the same topic may occasionally race when attempting to dequeue the same message. When this happens, the losing consumer receives a `BroccoliError::BrokerNonIdempotentOp` error. The `process_messages` helper retries automatically in this case, so you do not need to handle it explicitly in your own code.
+</Note>
+
+Consumption is implemented as a SurrealDB transaction: the queue entry is atomically removed and moved to the processing table in a single operation. If two consumers attempt the same entry simultaneously, one transaction wins and the other fails with an idempotency error, which triggers a retry on the next available message.
+
+## Limitations
+
+<Warning>
+Fairness (disambiguator) queues are **not supported** with the SurrealDB backend. The `disambiguator` parameter passed to `publish` is silently ignored. Use the Redis backend if you require per-publisher fair scheduling.
+</Warning>
+
+Additionally, message TTL (`PublishOptions::ttl`) is not implemented for SurrealDB and will return `BroccoliError::NotImplemented` if supplied. The `size` method is also not implemented for this backend.

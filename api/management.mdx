@@ -1,0 +1,146 @@
+---
+title: "Management API: Queue Status and Monitoring"
+sidebarTitle: "Management"
+description: "The management feature exposes QueueStatus, QueueType, and the QueueManagement trait for runtime queue inspection. Enable with the management feature flag in Cargo.toml."
+---
+
+The management API lets you inspect live queue state at runtime without reaching into the broker directly. It provides a structured `QueueStatus` snapshot that reports how many messages are waiting, how many are currently being processed, how many have failed, and — for fairness queues — how many disambiguator sub-queues exist. This is useful for dashboards, alerting, autoscaling signals, and operator tooling.
+
+## Enabling the Feature
+
+The management API is behind the `management` feature flag. Enable it alongside your broker feature in `Cargo.toml`:
+
+```toml
+broccoli_queue = { version = "0.4", features = ["redis", "management"] }
+```
+
+## `QueueStatus`
+
+`QueueStatus` is the data structure returned by every management query. It provides a point-in-time snapshot of a single queue's state.
+
+```rust
+#[derive(Debug, Clone)]
+pub struct QueueStatus {
+    pub name: String,
+    pub queue_type: QueueType,
+    pub size: usize,
+    pub processing: usize,
+    pub failed: usize,
+    pub disambiguator_count: Option<usize>,
+}
+```
+
+<ParamField path="name" type="String" required>
+  The logical name of the queue as passed to `queue_status`. Matches the `topic` string used in `publish` and `consume` calls.
+</ParamField>
+
+<ParamField path="queue_type" type="QueueType" required>
+  The category of the queue being reported. See the `QueueType` section below for possible values.
+</ParamField>
+
+<ParamField path="size" type="usize" required>
+  The number of messages currently waiting to be consumed from the main queue (i.e. not yet picked up by a worker).
+</ParamField>
+
+<ParamField path="processing" type="usize" required>
+  The number of messages that have been consumed but not yet acknowledged or rejected — in other words, messages currently held by an active worker.
+</ParamField>
+
+<ParamField path="failed" type="usize" required>
+  The number of messages that have exhausted their retry attempts and been moved to the failed queue.
+</ParamField>
+
+<ParamField path="disambiguator_count" type="Option<usize>">
+  For fairness queues, the number of distinct disambiguator sub-queues that currently have at least one message. `None` for standard (non-fairness) queues.
+</ParamField>
+
+## `QueueType`
+
+`QueueType` identifies which logical segment of a queue a status report refers to:
+
+```rust
+pub enum QueueType {
+    Failed,     // failed message queue
+    Processing, // in-flight message queue
+    Main,       // main topic queue
+    Fairness,   // fairness-mode queue
+}
+```
+
+| Variant | Description |
+|---|---|
+| `Main` | The primary queue where new messages are published and waiting to be consumed. |
+| `Processing` | The in-flight queue holding messages that have been picked up by a worker but not yet acknowledged. |
+| `Failed` | The dead-letter queue holding messages that have exceeded `retry_attempts`. |
+| `Fairness` | A fairness-partitioned queue where messages are distributed across disambiguator sub-queues. |
+
+## `QueueManagement` Trait
+
+Broker backends that support the management feature implement the `QueueManagement` trait:
+
+```rust
+#[async_trait::async_trait]
+pub trait QueueManagement {
+    async fn get_queue_status(
+        &self,
+        queue_name: String,
+        disambiguator: Option<String>,
+    ) -> Result<QueueStatus, BroccoliError>;
+}
+```
+
+<ParamField path="queue_name" type="String" required>
+  The name of the queue to inspect. Must be a non-empty string. Providing an empty string returns a `BroccoliError::QueueStatus` error.
+</ParamField>
+
+<ParamField path="disambiguator" type="Option<String>">
+  If the queue uses fairness mode, provide the disambiguator value to inspect a specific sub-queue. Pass `None` to query the aggregate status across all sub-queues.
+</ParamField>
+
+## `BroccoliQueue::queue_status`
+
+When the `management` feature is enabled, `BroccoliQueue` exposes a `queue_status` method that delegates to the underlying broker's `QueueManagement` implementation:
+
+```rust
+#[cfg(feature = "management")]
+pub async fn queue_status(
+    &self,
+    queue_name: String,
+    disambiguator: Option<String>,
+) -> Result<QueueStatus, BroccoliError>
+```
+
+## Usage Example
+
+The following example checks the status of both a standard queue and a specific fairness sub-queue:
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .build()
+    .await?;
+
+// Check the main queue
+let status = queue.queue_status("order-processing".to_string(), None).await?;
+println!("Queue:      {}", status.name);
+println!("Waiting:    {}", status.size);
+println!("Processing: {}", status.processing);
+println!("Failed:     {}", status.failed);
+
+// Check a specific fairness sub-queue for a tenant
+let tenant_status = queue
+    .queue_status("order-processing".to_string(), Some("tenant-42".to_string()))
+    .await?;
+println!("Tenant-42 waiting: {}", tenant_status.size);
+println!("Tenant-42 disambiguators: {:?}", tenant_status.disambiguator_count);
+
+// Alert if the failed queue is growing
+if status.failed > 100 {
+    eprintln!("Warning: {} failed messages in order-processing", status.failed);
+}
+```
+
+<Warning>
+  Passing an empty string for `queue_name` returns a `BroccoliError::QueueStatus` error. This guard prevents accidental full-keyspace scans on the broker backend (particularly Redis, where a wildcard key scan can be expensive on large instances). Always provide a specific, non-empty queue name.
+</Warning>

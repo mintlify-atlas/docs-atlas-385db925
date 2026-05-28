@@ -1,0 +1,300 @@
+---
+title: "Broker Trait: Implementing Custom Broker Backends"
+sidebarTitle: "Broker Trait"
+description: "The Broker async trait defines the interface all Broccoli Queue broker backends must implement. Use it to build custom broker backends beyond Redis, RabbitMQ, and SurrealDB."
+---
+
+The `Broker` trait is the core abstraction that every queue backend in Broccoli Queue must satisfy. The built-in backends — Redis, RabbitMQ, and SurrealDB — all implement this trait, and you can implement it yourself to connect any storage system as a message broker. All methods are async and the trait requires `Send + Sync` so implementations can be shared safely across Tokio tasks.
+
+## Trait Definition
+
+```rust
+#[async_trait::async_trait]
+pub trait Broker: Send + Sync {
+    async fn connect(&mut self, broker_url: &str) -> Result<(), BroccoliError>;
+
+    async fn publish(
+        &self,
+        queue_name: &str,
+        disambiguator: Option<String>,
+        message: &[InternalBrokerMessage],
+        options: Option<PublishOptions>,
+    ) -> Result<Vec<InternalBrokerMessage>, BroccoliError>;
+
+    async fn try_consume(
+        &self,
+        queue_name: &str,
+        options: Option<ConsumeOptions>,
+    ) -> Result<Option<InternalBrokerMessage>, BroccoliError>;
+
+    async fn try_consume_batch(
+        &self,
+        queue_name: &str,
+        batch_size: usize,
+        options: Option<ConsumeOptions>,
+    ) -> Result<Vec<InternalBrokerMessage>, BroccoliError>;
+
+    async fn consume(
+        &self,
+        queue_name: &str,
+        options: Option<ConsumeOptions>,
+    ) -> Result<InternalBrokerMessage, BroccoliError>;
+
+    async fn acknowledge(
+        &self,
+        queue_name: &str,
+        message: InternalBrokerMessage,
+    ) -> Result<(), BroccoliError>;
+
+    async fn reject(
+        &self,
+        queue_name: &str,
+        message: InternalBrokerMessage,
+    ) -> Result<(), BroccoliError>;
+
+    async fn cancel(
+        &self,
+        queue_name: &str,
+        message_id: String,
+    ) -> Result<(), BroccoliError>;
+
+    async fn size(
+        &self,
+        queue_name: &str,
+    ) -> Result<HashMap<String, u64>, BroccoliError>;
+}
+```
+
+<Note>
+  Rust does not natively support async functions in traits in all contexts. Broccoli Queue uses the [`async_trait`](https://docs.rs/async-trait) macro to work around this limitation. Your implementation must also apply `#[async_trait::async_trait]` (or `#[async_trait]` with a use declaration) to the `impl` block.
+</Note>
+
+## Method Reference
+
+### `connect`
+
+```rust
+async fn connect(&mut self, broker_url: &str) -> Result<(), BroccoliError>;
+```
+
+Called once during initialization to establish a connection to the broker backend. `broker_url` is the connection string passed to `BroccoliQueueBuilder::new`. Implementations should open connection pools, authenticate, and complete any one-time setup here. Returns `BroccoliError::Broker` on failure.
+
+---
+
+### `publish`
+
+```rust
+async fn publish(
+    &self,
+    queue_name: &str,
+    disambiguator: Option<String>,
+    message: &[InternalBrokerMessage],
+    options: Option<PublishOptions>,
+) -> Result<Vec<InternalBrokerMessage>, BroccoliError>;
+```
+
+Writes one or more messages to the named queue. The returned `Vec` must contain the messages as they were stored (with any broker-assigned metadata applied). Implementations should honour `PublishOptions` fields such as `ttl`, `priority`, `delay`, and `scheduled_at` where the backend supports them.
+
+<ParamField path="queue_name" type="&str" required>
+  The logical name of the destination queue.
+</ParamField>
+
+<ParamField path="disambiguator" type="Option<String>">
+  If set, routes the batch into a fairness sub-queue keyed by this value.
+</ParamField>
+
+<ParamField path="message" type="&[InternalBrokerMessage]" required>
+  The slice of serialized messages to publish. Each entry has already had its payload JSON-serialized.
+</ParamField>
+
+<ParamField path="options" type="Option<PublishOptions>">
+  Optional publish-time settings (TTL, priority, delay, scheduled time).
+</ParamField>
+
+---
+
+### `try_consume`
+
+```rust
+async fn try_consume(
+    &self,
+    queue_name: &str,
+    options: Option<ConsumeOptions>,
+) -> Result<Option<InternalBrokerMessage>, BroccoliError>;
+```
+
+Non-blocking poll. Returns `Ok(Some(msg))` if a message is immediately available, `Ok(None)` if the queue is empty, or `Err` on a backend error. Implementations must atomically move the message from the waiting queue to a processing queue so that the same message is never returned to two concurrent consumers.
+
+---
+
+### `try_consume_batch`
+
+```rust
+async fn try_consume_batch(
+    &self,
+    queue_name: &str,
+    batch_size: usize,
+    options: Option<ConsumeOptions>,
+) -> Result<Vec<InternalBrokerMessage>, BroccoliError>;
+```
+
+Non-blocking batch poll. Returns up to `batch_size` messages that are immediately available, or fewer if the queue does not have that many. The trait provides a **default implementation** that calls `try_consume` in a loop up to `batch_size` times, so backends only need to override this if they can execute a more efficient native batch operation.
+
+---
+
+### `consume`
+
+```rust
+async fn consume(
+    &self,
+    queue_name: &str,
+    options: Option<ConsumeOptions>,
+) -> Result<InternalBrokerMessage, BroccoliError>;
+```
+
+Blocking consume. Waits until a message is available and then returns it. Implementations typically use a blocking pop, long-poll, or a tight loop with back-off. This method underpins `BroccoliQueue::process_messages`.
+
+---
+
+### `acknowledge`
+
+```rust
+async fn acknowledge(
+    &self,
+    queue_name: &str,
+    message: InternalBrokerMessage,
+) -> Result<(), BroccoliError>;
+```
+
+Marks a message as successfully processed. The implementation should remove the message from the processing queue so it is not redelivered. Returns `BroccoliError::Acknowledge` if the operation fails.
+
+---
+
+### `reject`
+
+```rust
+async fn reject(
+    &self,
+    queue_name: &str,
+    message: InternalBrokerMessage,
+) -> Result<(), BroccoliError>;
+```
+
+Marks a message as failed. The implementation should increment `attempts` and, depending on `BrokerConfig::retry_failed` and `retry_attempts`, either re-queue the message for another attempt or move it to the failed queue. Returns `BroccoliError::Reject` on failure.
+
+---
+
+### `cancel`
+
+```rust
+async fn cancel(
+    &self,
+    queue_name: &str,
+    message_id: String,
+) -> Result<(), BroccoliError>;
+```
+
+Removes a specific message from the queue by its `task_id` string, regardless of whether it is waiting or in-flight. Useful for deduplication or externally triggered cancellation. Returns `BroccoliError::Cancel` on failure.
+
+---
+
+### `size`
+
+```rust
+async fn size(
+    &self,
+    queue_name: &str,
+) -> Result<HashMap<String, u64>, BroccoliError>;
+```
+
+Returns a map of queue segment names to their current message counts. For standard queues this is a single entry keyed by `queue_name`. For fairness queues, each disambiguator sub-queue appears as a separate entry. Used by the management API to report `QueueStatus`.
+
+## Implementing a Custom Broker
+
+The following skeleton shows the minimum structure for a custom broker implementation:
+
+```rust
+use std::collections::HashMap;
+use async_trait::async_trait;
+use broccoli_queue::brokers::broker::{Broker, InternalBrokerMessage};
+use broccoli_queue::error::BroccoliError;
+use broccoli_queue::queue::{ConsumeOptions, PublishOptions};
+
+pub struct MyCustomBroker {
+    // your connection handles, config, etc.
+}
+
+#[async_trait]
+impl Broker for MyCustomBroker {
+    async fn connect(&mut self, broker_url: &str) -> Result<(), BroccoliError> {
+        // open connections, authenticate, etc.
+        Ok(())
+    }
+
+    async fn publish(
+        &self,
+        queue_name: &str,
+        disambiguator: Option<String>,
+        message: &[InternalBrokerMessage],
+        options: Option<PublishOptions>,
+    ) -> Result<Vec<InternalBrokerMessage>, BroccoliError> {
+        // write messages to your backend and return them
+        Ok(message.to_vec())
+    }
+
+    async fn try_consume(
+        &self,
+        queue_name: &str,
+        options: Option<ConsumeOptions>,
+    ) -> Result<Option<InternalBrokerMessage>, BroccoliError> {
+        // non-blocking pop — return None if empty
+        Ok(None)
+    }
+
+    async fn consume(
+        &self,
+        queue_name: &str,
+        options: Option<ConsumeOptions>,
+    ) -> Result<InternalBrokerMessage, BroccoliError> {
+        // blocking pop — wait until a message arrives
+        todo!()
+    }
+
+    async fn acknowledge(
+        &self,
+        queue_name: &str,
+        message: InternalBrokerMessage,
+    ) -> Result<(), BroccoliError> {
+        Ok(())
+    }
+
+    async fn reject(
+        &self,
+        queue_name: &str,
+        message: InternalBrokerMessage,
+    ) -> Result<(), BroccoliError> {
+        Ok(())
+    }
+
+    async fn cancel(
+        &self,
+        queue_name: &str,
+        message_id: String,
+    ) -> Result<(), BroccoliError> {
+        Ok(())
+    }
+
+    async fn size(
+        &self,
+        queue_name: &str,
+    ) -> Result<HashMap<String, u64>, BroccoliError> {
+        Ok(HashMap::new())
+    }
+    // try_consume_batch has a default implementation — override only if your
+    // backend can fetch multiple messages more efficiently than looping.
+}
+```
+
+<Note>
+  `try_consume_batch` is the only method with a provided default implementation. All other methods are required. The default loops over `try_consume` up to `batch_size` times; override it if your backend supports a more efficient native batch read.
+</Note>

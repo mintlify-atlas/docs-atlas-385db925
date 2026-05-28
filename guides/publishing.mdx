@@ -1,0 +1,218 @@
+---
+title: "Publishing Messages to Broccoli Queue Topics"
+sidebarTitle: "Publishing"
+description: "Publish single messages, batches, delayed messages, and priority-ordered jobs to Broccoli Queue topics using the publish and publish_batch methods."
+---
+
+Broccoli Queue supports four publishing patterns that cover most production workloads: simple point-in-time publishing, batching multiple messages in a single call, delaying delivery by a duration, and scheduling delivery at an exact timestamp. All four patterns share the same underlying `publish` and `publish_batch` methods and are controlled through the `PublishOptions` struct.
+
+## Single message publish
+
+Use `publish` to send one message to a topic. The returned `BrokerMessage<T>` contains the auto-generated `task_id` UUID you can use for tracking or cancellation.
+
+```rust
+pub async fn publish<T: Clone + Serialize + DeserializeOwned>(
+    &self,
+    topic: &str,
+    disambiguator: Option<String>,
+    message: &T,
+    options: Option<PublishOptions>,
+) -> Result<BrokerMessage<T>, BroccoliError>
+```
+
+<Tabs>
+  <Tab title="Single publish">
+    ```rust
+    use broccoli_queue::queue::{BroccoliQueue, PublishOptions};
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct JobPayload {
+        id: String,
+        task_name: String,
+    }
+
+    #[tokio::main]
+    async fn main() -> Result<(), Box<dyn std::error::Error>> {
+        let queue = BroccoliQueue::builder("redis://localhost:6379")
+            .pool_connections(5)
+            .build()
+            .await?;
+
+        let job = JobPayload {
+            id: "job-1".to_string(),
+            task_name: "process_data".to_string(),
+        };
+
+        // Publish without options — immediate delivery, default priority
+        let published = queue.publish("jobs", None, &job, None).await?;
+
+        println!("Published with task_id: {}", published.task_id);
+        Ok(())
+    }
+    ```
+  </Tab>
+  <Tab title="Batch publish">
+    ```rust
+    use broccoli_queue::queue::{BroccoliQueue, PublishOptions};
+    use serde::{Deserialize, Serialize};
+    use time::Duration;
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct JobPayload {
+        id: String,
+        task_name: String,
+    }
+
+    #[tokio::main]
+    async fn main() -> Result<(), Box<dyn std::error::Error>> {
+        let queue = BroccoliQueue::builder("redis://localhost:6379")
+            .pool_connections(5)
+            .build()
+            .await?;
+
+        let jobs = vec![
+            JobPayload { id: "job-1".to_string(), task_name: "process_data".to_string() },
+            JobPayload { id: "job-2".to_string(), task_name: "generate_report".to_string() },
+        ];
+
+        // Publish all jobs with a 10-second delivery delay
+        let published = queue
+            .publish_batch(
+                "jobs",
+                None,
+                jobs,
+                Some(PublishOptions {
+                    delay: Some(Duration::seconds(10)),
+                    scheduled_at: None,
+                    ttl: None,
+                    priority: None,
+                }),
+            )
+            .await?;
+
+        let ids: Vec<_> = published.iter().map(|j| j.task_id).collect();
+        println!("Published {} jobs: {:?}", published.len(), ids);
+        Ok(())
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Batch publish
+
+Use `publish_batch` when you want to enqueue multiple messages atomically. It accepts any type that implements `IntoIterator<Item = T>`, including `Vec`, arrays, and iterators.
+
+```rust
+pub async fn publish_batch<T: Clone + Serialize + DeserializeOwned>(
+    &self,
+    topic: &str,
+    disambiguator: Option<String>,
+    messages: impl IntoIterator<Item = T>,
+    options: Option<PublishOptions>,
+) -> Result<Vec<BrokerMessage<T>>, BroccoliError>
+```
+
+The same `PublishOptions` apply to every message in the batch, including any delay, TTL, or priority value.
+
+## PublishOptions reference
+
+`PublishOptions` controls how and when a message is delivered:
+
+```rust
+pub struct PublishOptions {
+    /// Message time-to-live: the message is discarded after this duration expires
+    pub ttl: Option<Duration>,
+    /// Priority level from 1 (highest) to 5 (lowest)
+    pub priority: Option<u8>,
+    /// Relative delay before the message becomes visible to consumers
+    pub delay: Option<Duration>,
+    /// Absolute UTC timestamp at which the message becomes visible
+    pub scheduled_at: Option<OffsetDateTime>,
+}
+```
+
+### Builder pattern
+
+`PublishOptions` ships with a fluent builder so you do not have to populate every field manually:
+
+```rust
+use broccoli_queue::queue::PublishOptions;
+use time::Duration;
+
+let opts = PublishOptions::builder()
+    .priority(1)
+    .delay(Duration::seconds(30))
+    .build();
+```
+
+You can combine any subset of fields. Fields that are not set default to `None` (no constraint).
+
+<Note>
+  Priority `1` is **highest** and priority `5` is **lowest**. Consumers dequeue higher-priority messages first. The builder panics at runtime if you pass a value outside the `1–5` range.
+</Note>
+
+## Delayed delivery example
+
+The publisher example from the repository demonstrates publishing a batch with a 10-second delay:
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, PublishOptions};
+use serde::{Deserialize, Serialize};
+use time::Duration;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JobPayload {
+    id: String,
+    task_name: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .failed_message_retry_strategy(Default::default())
+        .pool_connections(5)
+        .enable_scheduling(true)
+        .build()
+        .await?;
+
+    let jobs = vec![
+        JobPayload {
+            id: "job-1".to_string(),
+            task_name: "process_data".to_string(),
+            created_at: chrono::Utc::now(),
+        },
+        JobPayload {
+            id: "job-2".to_string(),
+            task_name: "generate_report".to_string(),
+            created_at: chrono::Utc::now(),
+        },
+    ];
+
+    let published = queue
+        .publish_batch(
+            "jobs",
+            None,
+            jobs,
+            Some(PublishOptions {
+                delay: Some(Duration::seconds(10)),
+                scheduled_at: None,
+                ttl: None,
+                priority: None,
+            }),
+        )
+        .await?;
+
+    println!(
+        "Published delayed jobs: {:?}",
+        published.iter().map(|j| j.task_id).collect::<Vec<_>>()
+    );
+
+    Ok(())
+}
+```
+
+<Warning>
+  Scheduling and delay features require `.enable_scheduling(true)` on the `BroccoliQueueBuilder`. If you use RabbitMQ as your broker, you must also install the [`rabbitmq_delayed_message_exchange`](https://www.rabbitmq.com/blog/2015/04/16/scheduling-messages-with-rabbitmq) plugin before enabling scheduling.
+</Warning>

@@ -1,0 +1,168 @@
+---
+title: "Broker Backends: Redis, RabbitMQ, and SurrealDB"
+sidebarTitle: "Brokers"
+description: "Broccoli Queue supports Redis, RabbitMQ, and SurrealDB as broker backends. Each is selected automatically from the connection URL. Learn how the Broker trait works."
+---
+
+Broccoli Queue is broker-agnostic. The same `BroccoliQueue` API works regardless of whether your messages are stored in Redis, delivered through RabbitMQ, or persisted in SurrealDB. The correct broker implementation is selected automatically at runtime by inspecting the scheme of the connection URL you pass to `BroccoliQueue::builder`. No runtime configuration flags or match statements are needed — just supply the right URL.
+
+## URL Scheme to Broker Mapping
+
+| Broker | URL Prefix | Cargo Feature Flag |
+|--------|------------|--------------------|
+| Redis | `redis://` or `rediss://` | `redis` (enabled by default) |
+| RabbitMQ | `amqp://` | `rabbitmq` |
+| SurrealDB | `ws://` or `mem://` | `surrealdb` |
+
+<Note>
+  Each broker backend is gated behind a Cargo feature flag. If the feature is not
+  enabled at compile time, the URL scheme will not be recognised and
+  `BroccoliQueue::builder(...).build().await` will return a
+  `BroccoliError::Broker("Unsupported broker URL scheme")` error. Enable the
+  appropriate feature in your `Cargo.toml` before building.
+</Note>
+
+### Enabling Broker Features
+
+```toml
+[dependencies]
+# Redis (default)
+broccoli_queue = { version = "*", features = ["redis"] }
+
+# RabbitMQ
+broccoli_queue = { version = "*", features = ["rabbitmq"] }
+
+# SurrealDB
+broccoli_queue = { version = "*", features = ["surrealdb"] }
+
+# Multiple brokers in one binary
+broccoli_queue = { version = "*", features = ["redis", "rabbitmq"] }
+```
+
+## The `BrokerType` Enum
+
+The internal `BrokerType` enum lists every supported backend. Feature flags gate individual variants at compile time:
+
+```rust
+pub enum BrokerType {
+    /// Redis-based message broker
+    #[cfg(feature = "redis")]
+    Redis,
+
+    /// RabbitMQ-based message broker
+    #[cfg(feature = "rabbitmq")]
+    RabbitMQ,
+
+    /// SurrealDB-based message broker
+    #[cfg(feature = "surrealdb")]
+    SurrealDB,
+}
+```
+
+You do not normally interact with `BrokerType` directly — `connect_to_broker` resolves it from the URL and constructs the matching implementation.
+
+## The `Broker` Trait
+
+All broker implementations satisfy the `Broker` async trait defined in `broccoli_queue::brokers::broker`. The trait gives each backend a uniform interface:
+
+```rust
+#[async_trait::async_trait]
+pub trait Broker: Send + Sync {
+    /// Establish a connection to the broker.
+    async fn connect(&mut self, broker_url: &str) -> Result<(), BroccoliError>;
+
+    /// Publish one or more messages to a queue.
+    async fn publish(
+        &self,
+        queue_name: &str,
+        disambiguator: Option<String>,
+        message: &[InternalBrokerMessage],
+        options: Option<PublishOptions>,
+    ) -> Result<Vec<InternalBrokerMessage>, BroccoliError>;
+
+    /// Non-blocking poll — returns `None` immediately if no message is available.
+    async fn try_consume(
+        &self,
+        queue_name: &str,
+        options: Option<ConsumeOptions>,
+    ) -> Result<Option<InternalBrokerMessage>, BroccoliError>;
+
+    /// Blocking consume — waits until a message is available.
+    async fn consume(
+        &self,
+        queue_name: &str,
+        options: Option<ConsumeOptions>,
+    ) -> Result<InternalBrokerMessage, BroccoliError>;
+
+    /// Acknowledge successful processing and remove the message from the queue.
+    async fn acknowledge(
+        &self,
+        queue_name: &str,
+        message: InternalBrokerMessage,
+    ) -> Result<(), BroccoliError>;
+
+    /// Reject a message, triggering retry or failed-queue routing.
+    async fn reject(
+        &self,
+        queue_name: &str,
+        message: InternalBrokerMessage,
+    ) -> Result<(), BroccoliError>;
+
+    /// Cancel a message, deleting it from the queue without processing.
+    async fn cancel(&self, queue_name: &str, message_id: String) -> Result<(), BroccoliError>;
+
+    /// Return the current depth of the queue (or per-disambiguator depths).
+    async fn size(&self, queue_name: &str) -> Result<HashMap<String, u64>, BroccoliError>;
+}
+```
+
+Implementing `Broker` on your own struct and wiring it up to `BroccoliQueue` is the extension point for custom backends such as PostgreSQL LISTEN/NOTIFY, Kafka, or in-memory test doubles.
+
+## Supported Broker Backends
+
+<CardGroup cols={3}>
+  <Card title="Redis" icon="server" href="/brokers/redis">
+    The default backend. Uses Redis lists for FIFO queues and supports fairness
+    scheduling, TTL, priority, and connection pooling via a configurable pool
+    size.
+  </Card>
+  <Card title="RabbitMQ" icon="circle-nodes" href="/brokers/rabbitmq">
+    AMQP-based broker with native priority queues, message TTL, and optional
+    delayed-message scheduling via the RabbitMQ delayed-exchange plugin.
+  </Card>
+  <Card title="SurrealDB" icon="database" href="/brokers/surrealdb">
+    Embeddable or server-mode backend using SurrealDB tables. Supports an
+    in-memory mode (`mem://`) for testing and WebSocket connections (`ws://`)
+    for production deployments.
+  </Card>
+</CardGroup>
+
+## Custom Broker Implementations
+
+Because broker selection resolves to the `Broker` trait at compile time, you can supply your own backend by implementing the trait and constructing a `BroccoliQueue` that wraps it. This is useful for testing with an in-process fake, or for integrating a broker not yet supported out of the box.
+
+```rust
+use broccoli_queue::brokers::broker::{Broker, InternalBrokerMessage};
+use broccoli_queue::queue::{ConsumeOptions, PublishOptions};
+use broccoli_queue::error::BroccoliError;
+use std::collections::HashMap;
+
+struct MyCustomBroker;
+
+#[async_trait::async_trait]
+impl Broker for MyCustomBroker {
+    async fn connect(&mut self, _broker_url: &str) -> Result<(), BroccoliError> {
+        // Initialize connection
+        Ok(())
+    }
+
+    // ... implement remaining methods
+    # async fn publish(&self, _: &str, _: Option<String>, _: &[InternalBrokerMessage], _: Option<PublishOptions>) -> Result<Vec<InternalBrokerMessage>, BroccoliError> { Ok(vec![]) }
+    # async fn try_consume(&self, _: &str, _: Option<ConsumeOptions>) -> Result<Option<InternalBrokerMessage>, BroccoliError> { Ok(None) }
+    # async fn consume(&self, _: &str, _: Option<ConsumeOptions>) -> Result<InternalBrokerMessage, BroccoliError> { todo!() }
+    # async fn acknowledge(&self, _: &str, _: InternalBrokerMessage) -> Result<(), BroccoliError> { Ok(()) }
+    # async fn reject(&self, _: &str, _: InternalBrokerMessage) -> Result<(), BroccoliError> { Ok(()) }
+    # async fn cancel(&self, _: &str, _: String) -> Result<(), BroccoliError> { Ok(()) }
+    # async fn size(&self, _: &str) -> Result<HashMap<String, u64>, BroccoliError> { Ok(HashMap::new()) }
+}
+```

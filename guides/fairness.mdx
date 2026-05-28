@@ -1,0 +1,165 @@
+---
+title: "Fair Queue Scheduling with Disambiguators"
+sidebarTitle: "Fairness Queues"
+description: "Broccoli Queue's fairness mode uses a round-robin disambiguator system to prevent any single producer from monopolizing the queue. Only supported by the Redis broker."
+---
+
+In a standard queue, a producer that publishes a large burst of messages causes those messages to be processed before anything from slower or less frequent producers. In a multi-tenant system — where each tenant, job type, or user maps to a separate stream of work — this creates starvation: a busy tenant monopolises the workers while quieter tenants wait indefinitely.
+
+Broccoli Queue solves this with **fairness mode**. When fairness is enabled, the queue rotates through producers in round-robin order so that each producer gets proportional throughput regardless of how many messages it has pending.
+
+## The disambiguator concept
+
+A **disambiguator** is a plain string you attach to a message at publish time. It identifies which producer, tenant, or job group the message belongs to. Broccoli Queue maintains a separate sub-queue per disambiguator and advances through them in round-robin order at consume time.
+
+Common values for disambiguators are:
+
+- Tenant or organisation IDs (`"tenant-a"`, `"org-42"`)
+- Job type identifiers (`"image-resize"`, `"pdf-export"`)
+- User IDs for per-user work queues
+
+## Publishing with a disambiguator
+
+Pass the disambiguator string as the second argument to `publish` or `publish_batch`:
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JobPayload { id: String }
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .pool_connections(5)
+        .build()
+        .await?;
+
+    let job = JobPayload { id: "job-1".to_string() };
+
+    // This message is attributed to "tenant-a"
+    queue
+        .publish("jobs", Some("tenant-a".to_string()), &job, None)
+        .await?;
+
+    let job2 = JobPayload { id: "job-2".to_string() };
+
+    // This message is attributed to "tenant-b"
+    queue
+        .publish("jobs", Some("tenant-b".to_string()), &job2, None)
+        .await?;
+
+    Ok(())
+}
+```
+
+## Internal Redis data structures
+
+When you publish with a disambiguator, Broccoli Queue creates the following Redis keys (using `{topic}` = `"jobs"` and `{disambiguator}` = `"tenant-a"` as an example):
+
+| Purpose | Redis Key |
+|---------|-----------|
+| Main sub-queue for this disambiguator | `jobs_tenant-a_queue` |
+| In-flight (processing) messages | `jobs_tenant-a_processing` |
+| Failed messages (retry exhausted) | `jobs_tenant-a_failed` |
+| Set of all known disambiguators | `jobs_fairness_set` |
+| Round-robin pointer list | `jobs_fairness_round_robin` |
+
+The `fairness_set` and `fairness_round_robin` keys are shared across all disambiguators for a given topic and are used by the consumer to select which sub-queue to dequeue from next.
+
+## Consuming with fairness enabled
+
+Pass `ConsumeOptions` with `fairness: true` to activate round-robin consumption. Without this flag, the consumer reads from the unfair main queue and the fairness sub-queues are never drained.
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, ConsumeOptionsBuilder};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JobPayload { id: String }
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .pool_connections(5)
+        .build()
+        .await?;
+
+    let options = ConsumeOptionsBuilder::new()
+        .fairness(true)
+        .build();
+
+    let message = queue
+        .consume::<JobPayload>("jobs", Some(options))
+        .await?;
+
+    println!(
+        "Consumed from disambiguator: {:?}",
+        message.disambiguator
+    );
+
+    queue.acknowledge("jobs", message).await?;
+
+    Ok(())
+}
+```
+
+### Using process_messages with fairness
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, ConsumeOptions, ConsumeOptionsBuilder};
+use broccoli_queue::brokers::broker::BrokerMessage;
+use broccoli_queue::error::BroccoliError;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JobPayload { id: String }
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .pool_connections(5)
+        .build()
+        .await?;
+
+    let options = ConsumeOptions::builder().fairness(true).build();
+
+    queue
+        .process_messages(
+            "jobs",
+            Some(4),
+            Some(options),
+            |msg: BrokerMessage<JobPayload>| async move {
+                println!(
+                    "Processing job {} from {:?}",
+                    msg.payload.id,
+                    msg.disambiguator
+                );
+                Ok(())
+            },
+        )
+        .await?;
+
+    Ok(())
+}
+```
+
+## How round-robin works
+
+Consider two disambiguators: `tenant-a` with 10 pending messages and `tenant-b` with 1 pending message. In standard queue mode `tenant-a`'s messages would all be processed before `tenant-b` gets a turn. With fairness mode:
+
+1. Consumer reads one message from `tenant-a`
+2. Consumer reads one message from `tenant-b`
+3. Consumer reads another message from `tenant-a`
+4. `tenant-b` has no more messages — `tenant-a` takes consecutive turns until a new disambiguator publishes
+
+No single producer can hold the workers hostage regardless of burst size. When a disambiguator's sub-queue empties, it is removed from the rotation automatically.
+
+<Note>
+  Fairness mode is implemented exclusively by the **Redis broker**. The RabbitMQ and SurrealDB brokers do not support disambiguators. Passing `fairness: true` with a non-Redis broker is silently ignored.
+</Note>
+
+<Warning>
+  You must use the **same disambiguator string** for `acknowledge` and `reject` as was used when publishing the message. The disambiguator is embedded in the message's `disambiguator` field on the returned `BrokerMessage<T>` — you can read it from there rather than tracking it yourself. Mismatched disambiguators result in orphaned entries in the processing queue.
+</Warning>

@@ -1,0 +1,207 @@
+---
+title: "BroccoliError: Error Types Reference"
+sidebarTitle: "Errors"
+description: "BroccoliError enumerates all error conditions in Broccoli Queue: broker connection failures, publish/consume errors, serialization, and broker-specific errors for Redis and SurrealDB."
+---
+
+All fallible operations in Broccoli Queue return `Result<T, BroccoliError>`. The error type is defined with [`thiserror`](https://docs.rs/thiserror), which generates ergonomic `Display` and `From` implementations automatically. This means you can use `?` to propagate errors, match on specific variants for targeted recovery, and rely on `From` conversions for `serde_json::Error` and — when the relevant feature flags are enabled — `redis::RedisError` and `surrealdb::Error`.
+
+## Error Enum
+
+```rust
+#[derive(Debug, thiserror::Error)]
+pub enum BroccoliError {
+    #[error("Broker error: {0}")]
+    Broker(String),
+
+    #[error("Broker error: non-idempotent operation {0}")]
+    BrokerNonIdempotentOp(String),
+
+    #[error("Broker error: non-idempotent retriable operation {0}")]
+    BrokerNonIdempotentRetriableOp(String),
+
+    #[error("Failed to publish message: {0}")]
+    Publish(String),
+
+    #[error("Failed to consume message: {0}")]
+    Consume(String),
+
+    #[error("Failed to acknowledge message: {0}")]
+    Acknowledge(String),
+
+    #[error("Failed to reject message: {0}")]
+    Reject(String),
+
+    #[error("Failed to cancel message: {0}")]
+    Cancel(String),
+
+    #[error("Failed to get message position: {0}")]
+    GetMessagePosition(String),
+
+    #[error("Serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+
+    #[cfg(feature = "redis")]
+    #[error("Redis error: {0}")]
+    Redis(#[from] redis::RedisError),
+
+    #[cfg(feature = "surrealdb")]
+    #[error("SurrealDB error: {0}")]
+    SurrealDB(#[from] surrealdb::Error),
+
+    #[error("Job error: {0}")]
+    Job(String),
+
+    #[error("Queue status error: {0}")]
+    QueueStatus(String),
+
+    #[error("Connection timeout after {0} retries")]
+    ConnectionTimeout(u32),
+
+    #[error("Feature not implemented")]
+    NotImplemented,
+}
+```
+
+## Variant Reference
+
+### `Broker(String)`
+
+A general broker-level error. Occurs during connection failures, pool initialization problems, or other infrastructure-level issues that do not fall into a more specific category. The inner `String` contains the underlying error detail.
+
+---
+
+### `BrokerNonIdempotentOp(String)`
+
+Signals that a concurrent broker operation was not idempotent — two workers attempted the same non-atomic read at the same time. In practice this only arises with the SurrealDB backend when multiple parallel consumers read from the same topic simultaneously.
+
+<Note>
+  You do not need to handle `BrokerNonIdempotentOp` yourself in most cases. `BroccoliQueue::process_messages` detects this variant internally, logs a warning, and continues the consume loop automatically without propagating the error to your handler. It is documented here for completeness and for custom `Broker` implementations.
+</Note>
+
+---
+
+### `BrokerNonIdempotentRetriableOp(String)`
+
+Similar to `BrokerNonIdempotentOp`, but the operation is safe to retry immediately. Occurs when multiple SurrealDB operations contend on the same table. The inner `String` describes which operation conflicted.
+
+---
+
+### `Publish(String)`
+
+Returned when a `publish` or `publish_batch` call fails. Common causes include a lost broker connection, a serialization error on the payload, or a backend-specific write error.
+
+---
+
+### `Consume(String)`
+
+Returned when a `consume`, `try_consume`, `consume_batch`, or `try_consume_batch` call fails. Common causes include a lost connection, a timeout exceeding backend limits, or a deserialization failure when converting `InternalBrokerMessage` back to `BrokerMessage<T>`.
+
+---
+
+### `Acknowledge(String)`
+
+Returned when `acknowledge` fails. This usually means the message had already been acknowledged (double-ack), the processing queue entry had expired, or the connection to the broker was lost before the acknowledgment completed.
+
+---
+
+### `Reject(String)`
+
+Returned when `reject` fails. Possible causes include the processing queue entry being missing, a network error, or the backend failing to atomically move the message to the retry or failed queue.
+
+---
+
+### `Cancel(String)`
+
+Returned when `cancel` fails to remove a message by its ID. The message may have already been acknowledged, or the ID may not exist in the queue.
+
+---
+
+### `GetMessagePosition(String)`
+
+Returned when a broker cannot report the position of a specific message within the queue. Some backends (notably RabbitMQ) do not support position queries and return `NotImplemented` instead.
+
+---
+
+### `Serialization(serde_json::Error)`
+
+Wraps a `serde_json::Error` that occurred while serializing a payload for publication or deserializing one after consumption. Implements `From<serde_json::Error>` so the `?` operator converts automatically.
+
+---
+
+### `Redis(redis::RedisError)` *(feature: `redis`)*
+
+Wraps a raw `redis::RedisError`. Only present when the `redis` feature is enabled. Implements `From<redis::RedisError>` for transparent conversion inside the Redis broker implementation. You may match on this variant when using the Redis backend to inspect low-level Redis error codes.
+
+---
+
+### `SurrealDB(surrealdb::Error)` *(feature: `surrealdb`)*
+
+Wraps a raw `surrealdb::Error`. Only present when the `surrealdb` feature is enabled. Implements `From<surrealdb::Error>` for transparent conversion inside the SurrealDB broker implementation.
+
+---
+
+### `Job(String)`
+
+Returned for errors that occur during job-level processing — for example, when a handler closure returns an error that the queue system converts into a structured failure record.
+
+---
+
+### `QueueStatus(String)`
+
+Returned by `BroccoliQueue::queue_status` (management feature) when the status query fails. Common causes include providing an empty queue name or a backend connectivity issue.
+
+---
+
+### `ConnectionTimeout(u32)`
+
+Returned when the broker connection cannot be established after a configurable number of retries. The `u32` field is the number of retry attempts that were made before giving up.
+
+---
+
+### `NotImplemented`
+
+Indicates that the operation is not supported by the current broker backend. For example, getting a message's queue position is not supported by RabbitMQ and returns this variant instead of `GetMessagePosition`.
+
+## Matching on Errors
+
+<Tip>
+  Match on specific variants to apply targeted recovery logic, and use a catch-all arm for unexpected errors:
+
+  ```rust
+  use broccoli_queue::error::BroccoliError;
+
+  match queue.publish("jobs", None, &job, None).await {
+      Ok(msg) => println!("Published: {}", msg.task_id),
+      Err(BroccoliError::Publish(e)) => eprintln!("Publish failed: {}", e),
+      Err(BroccoliError::Broker(e)) => eprintln!("Broker error: {}", e),
+      Err(BroccoliError::ConnectionTimeout(retries)) => {
+          eprintln!("Could not connect after {} retries", retries);
+      }
+      Err(e) => eprintln!("Unexpected error: {}", e),
+  }
+  ```
+</Tip>
+
+## Feature-Gated Variants
+
+Two variants are conditionally compiled based on enabled Cargo features:
+
+| Variant | Required feature | Wrapped type |
+|---|---|---|
+| `Redis` | `redis` | `redis::RedisError` |
+| `SurrealDB` | `surrealdb` | `surrealdb::Error` |
+
+Both implement `From` for their respective error types, enabling `?`-based propagation without manual conversion inside broker implementation code.
+
+## Automatic Conversions
+
+The following `From` implementations are always available regardless of feature flags:
+
+```rust
+// serde_json errors convert automatically
+impl From<serde_json::Error> for BroccoliError { ... }
+
+// Use ? in any context that returns Result<_, BroccoliError>
+let value: MyType = serde_json::from_str(&raw)?; // auto-converts on failure
+```

@@ -1,0 +1,596 @@
+---
+title: "BroccoliQueue API Reference"
+sidebarTitle: "BroccoliQueue"
+description: "Complete API reference for BroccoliQueue: the main interface for publishing, consuming, acknowledging, and processing messages in Broccoli Queue."
+---
+
+`BroccoliQueue` is the central entry point for all interactions with a Broccoli Queue broker. It wraps an async-safe, pooled connection to the underlying message broker (Redis, AMQP, SurrealDB, etc.) and exposes a unified API for publishing messages, consuming them one at a time or in batches, acknowledging or rejecting work, and running concurrent message-processing loops. Every instance is cheaply cloneable — all clones share the same underlying connection pool via `Arc`.
+
+## Builder pattern
+
+Construct a `BroccoliQueue` using the fluent builder. The builder is the only public way to create an instance.
+
+```rust
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .pool_connections(5)
+    .failed_message_retry_strategy(RetryStrategy::default())
+    .enable_scheduling(false)
+    .build()
+    .await?;
+```
+
+---
+
+## `BroccoliQueue::builder`
+
+```rust
+pub fn builder(broker_url: impl Into<String>) -> BroccoliQueueBuilder
+```
+
+Creates a new `BroccoliQueueBuilder` configured for the given broker URL. Call `.build().await` on the returned builder to establish the connection.
+
+<ParamField path="broker_url" type="impl Into<String>" required>
+  Connection string for the message broker. Supported schemes include `redis://`, `rediss://`, `amqp://`, `amqps://`, and `ws://` (SurrealDB). For example: `redis://localhost:6379` or `amqp://guest:guest@localhost:5672`.
+</ParamField>
+
+**Returns:** `BroccoliQueueBuilder` — a builder with fluent configuration methods.
+
+### Builder methods
+
+<ParamField path="pool_connections" type="u8">
+  Number of connections to maintain in the connection pool. Higher values allow more concurrent broker operations. Defaults to the broker's built-in default when not set.
+</ParamField>
+
+<ParamField path="failed_message_retry_strategy" type="RetryStrategy">
+  Configures how rejected messages are handled. Accepts a [`RetryStrategy`](/api/retry-strategy) value. Defaults to 3 retry attempts with retrying enabled.
+</ParamField>
+
+<ParamField path="enable_scheduling" type="bool">
+  Enables delayed and scheduled message delivery via `PublishOptions::delay` or `PublishOptions::scheduled_at`. When using RabbitMQ, the [delayed-exchange plugin](https://www.rabbitmq.com/blog/2015/04/16/scheduling-messages-with-rabbitmq) must be installed. Defaults to `false`.
+</ParamField>
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, RetryStrategy};
+
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .pool_connections(10)
+    .failed_message_retry_strategy(RetryStrategy::new().with_attempts(5))
+    .enable_scheduling(true)
+    .build()
+    .await?;
+```
+
+---
+
+## `BroccoliQueue::publish`
+
+```rust
+pub async fn publish<T: Clone + Serialize + DeserializeOwned>(
+    &self,
+    topic: &str,
+    disambiguator: Option<String>,
+    message: &T,
+    options: Option<PublishOptions>,
+) -> Result<BrokerMessage<T>, BroccoliError>
+```
+
+Publishes a single message to the specified topic. The message payload must implement `Clone`, `Serialize`, and `DeserializeOwned`. On success, returns the `BrokerMessage` as stored by the broker, including the assigned `task_id`.
+
+<ParamField path="topic" type="&str" required>
+  The queue/topic name to publish to (e.g., `"jobs"`, `"email-notifications"`).
+</ParamField>
+
+<ParamField path="disambiguator" type="Option<String>">
+  An optional sub-queue identifier used for fairness queues. When set, the message is routed to a per-disambiguator queue (e.g., a tenant ID or user ID). Pass `None` for standard queues.
+</ParamField>
+
+<ParamField path="message" type="&T" required>
+  A reference to the message payload. The type `T` must implement `Serialize` and `DeserializeOwned`.
+</ParamField>
+
+<ParamField path="options" type="Option<PublishOptions>">
+  Optional publishing configuration: TTL, priority, delay, or scheduled time. See [`PublishOptions`](/api/publish-options). Pass `None` for defaults.
+</ParamField>
+
+**Returns:** `Result<BrokerMessage<T>, BroccoliError>`
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, PublishOptions};
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct EmailJob { to: String, subject: String }
+
+let job = EmailJob {
+    to: "user@example.com".into(),
+    subject: "Welcome!".into(),
+};
+
+let published = queue.publish("emails", None, &job, None).await?;
+println!("Published with ID: {}", published.task_id);
+```
+
+---
+
+## `BroccoliQueue::publish_batch`
+
+```rust
+pub async fn publish_batch<T: Clone + Serialize + DeserializeOwned>(
+    &self,
+    topic: &str,
+    disambiguator: Option<String>,
+    messages: impl IntoIterator<Item = T>,
+    options: Option<PublishOptions>,
+) -> Result<Vec<BrokerMessage<T>>, BroccoliError>
+```
+
+Publishes multiple messages to the specified topic in a single broker call. More efficient than calling `publish` in a loop. All messages share the same `PublishOptions`.
+
+<ParamField path="topic" type="&str" required>
+  The queue/topic name to publish to.
+</ParamField>
+
+<ParamField path="disambiguator" type="Option<String>">
+  Optional sub-queue identifier for fairness routing. Applied to every message in the batch.
+</ParamField>
+
+<ParamField path="messages" type="impl IntoIterator<Item = T>" required>
+  Any iterable of message payloads. Commonly a `Vec<T>`, an array, or a lazy iterator.
+</ParamField>
+
+<ParamField path="options" type="Option<PublishOptions>">
+  Optional publishing configuration applied uniformly to all messages in the batch.
+</ParamField>
+
+**Returns:** `Result<Vec<BrokerMessage<T>>, BroccoliError>` — one `BrokerMessage` per published item, in the same order.
+
+```rust
+let jobs = vec![
+    EmailJob { to: "a@example.com".into(), subject: "Hello A".into() },
+    EmailJob { to: "b@example.com".into(), subject: "Hello B".into() },
+];
+
+let published = queue.publish_batch("emails", None, jobs, None).await?;
+println!("Published {} messages", published.len());
+```
+
+---
+
+## `BroccoliQueue::consume`
+
+```rust
+pub async fn consume<T: Clone + Serialize + DeserializeOwned>(
+    &self,
+    topic: &str,
+    options: Option<ConsumeOptions>,
+) -> Result<BrokerMessage<T>, BroccoliError>
+```
+
+Consumes the next available message from the topic. **Blocks until a message is available.** The message is moved to a processing state and will not be re-delivered until it is acknowledged or rejected. Use [`acknowledge`](#broccoliqueue-acknowledge) to confirm successful processing, or [`reject`](#broccoliqueue-reject) to mark it as failed.
+
+<ParamField path="topic" type="&str" required>
+  The queue/topic name to consume from.
+</ParamField>
+
+<ParamField path="options" type="Option<ConsumeOptions>">
+  Optional consumption configuration: auto-ack, fairness, polling interval, and handler-ack behavior. See [`ConsumeOptions`](/api/consume-options).
+</ParamField>
+
+**Returns:** `Result<BrokerMessage<T>, BroccoliError>`
+
+```rust
+let message: BrokerMessage<EmailJob> = queue.consume("emails", None).await?;
+println!("Got job for: {}", message.payload.to);
+queue.acknowledge("emails", message).await?;
+```
+
+---
+
+## `BroccoliQueue::try_consume`
+
+```rust
+pub async fn try_consume<T: Clone + Serialize + DeserializeOwned>(
+    &self,
+    topic: &str,
+    options: Option<ConsumeOptions>,
+) -> Result<Option<BrokerMessage<T>>, BroccoliError>
+```
+
+Attempts to consume a message without blocking. Returns `None` immediately if no message is currently available. Useful for polling loops where you want to do other work when the queue is empty.
+
+<ParamField path="topic" type="&str" required>
+  The queue/topic name to consume from.
+</ParamField>
+
+<ParamField path="options" type="Option<ConsumeOptions>">
+  Optional consumption configuration. See [`ConsumeOptions`](/api/consume-options).
+</ParamField>
+
+**Returns:** `Result<Option<BrokerMessage<T>>, BroccoliError>` — `Ok(Some(msg))` if a message was available, `Ok(None)` if the queue was empty.
+
+```rust
+if let Some(message) = queue.try_consume::<EmailJob>("emails", None).await? {
+    process(&message).await?;
+    queue.acknowledge("emails", message).await?;
+} else {
+    println!("Queue is empty, sleeping...");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+}
+```
+
+---
+
+## `BroccoliQueue::consume_batch`
+
+```rust
+pub async fn consume_batch<T: Clone + Serialize + DeserializeOwned>(
+    &self,
+    topic: &str,
+    batch_size: usize,
+    timeout: Duration,
+    options: Option<ConsumeOptions>,
+) -> Result<Vec<BrokerMessage<T>>, BroccoliError>
+```
+
+Consumes up to `batch_size` messages, blocking until either the batch is full or the `timeout` elapses. Returns however many messages were collected before the deadline. Each message must still be individually acknowledged or rejected.
+
+<ParamField path="topic" type="&str" required>
+  The queue/topic name to consume from.
+</ParamField>
+
+<ParamField path="batch_size" type="usize" required>
+  Maximum number of messages to collect in a single call.
+</ParamField>
+
+<ParamField path="timeout" type="time::Duration" required>
+  Maximum wall-clock time to wait for the batch to fill. The method returns early with a partial batch once the deadline passes.
+</ParamField>
+
+<ParamField path="options" type="Option<ConsumeOptions>">
+  Optional consumption configuration. See [`ConsumeOptions`](/api/consume-options).
+</ParamField>
+
+**Returns:** `Result<Vec<BrokerMessage<T>>, BroccoliError>` — between 0 and `batch_size` messages.
+
+```rust
+use time::Duration;
+
+let messages = queue
+    .consume_batch::<EmailJob>("emails", 50, Duration::seconds(5), None)
+    .await?;
+
+for msg in messages {
+    process(&msg).await?;
+    queue.acknowledge("emails", msg).await?;
+}
+```
+
+---
+
+## `BroccoliQueue::try_consume_batch`
+
+```rust
+pub async fn try_consume_batch<T: Clone + Serialize + DeserializeOwned>(
+    &self,
+    topic: &str,
+    batch_size: usize,
+    options: Option<ConsumeOptions>,
+) -> Result<Vec<BrokerMessage<T>>, BroccoliError>
+```
+
+Non-blocking variant of `consume_batch`. Returns immediately with whatever messages are currently available, up to `batch_size`. Returns an empty `Vec` if the queue is empty.
+
+<ParamField path="topic" type="&str" required>
+  The queue/topic name to consume from.
+</ParamField>
+
+<ParamField path="batch_size" type="usize" required>
+  Maximum number of messages to return. Fewer may be returned if not enough are available.
+</ParamField>
+
+<ParamField path="options" type="Option<ConsumeOptions>">
+  Optional consumption configuration. See [`ConsumeOptions`](/api/consume-options).
+</ParamField>
+
+**Returns:** `Result<Vec<BrokerMessage<T>>, BroccoliError>`
+
+```rust
+let messages = queue
+    .try_consume_batch::<EmailJob>("emails", 10, None)
+    .await?;
+
+println!("Collected {} messages without blocking", messages.len());
+```
+
+---
+
+## `BroccoliQueue::acknowledge`
+
+```rust
+pub async fn acknowledge<T: Clone + Serialize + DeserializeOwned>(
+    &self,
+    topic: &str,
+    message: BrokerMessage<T>,
+) -> Result<(), BroccoliError>
+```
+
+Acknowledges that a message has been successfully processed, removing it from the processing queue. Call this after your handler completes successfully. If the message was consumed with `auto_ack: true`, calling this will return an error.
+
+<ParamField path="topic" type="&str" required>
+  The topic the message was consumed from. Must match the topic used in `consume`.
+</ParamField>
+
+<ParamField path="message" type="BrokerMessage<T>" required>
+  The `BrokerMessage` returned from a prior `consume`, `try_consume`, or batch variant. The message is consumed by value and cannot be used after this call.
+</ParamField>
+
+**Returns:** `Result<(), BroccoliError>`
+
+```rust
+let message = queue.consume::<EmailJob>("emails", None).await?;
+match send_email(&message.payload).await {
+    Ok(_) => queue.acknowledge("emails", message).await?,
+    Err(e) => queue.reject("emails", message).await?,
+}
+```
+
+---
+
+## `BroccoliQueue::reject`
+
+```rust
+pub async fn reject<T: Clone + Serialize + DeserializeOwned>(
+    &self,
+    topic: &str,
+    message: BrokerMessage<T>,
+) -> Result<(), BroccoliError>
+```
+
+Marks a message as failed. Depending on the queue's [`RetryStrategy`](/api/retry-strategy), the message will either be re-queued for another attempt or moved permanently to the `{topic}_failed` queue.
+
+<ParamField path="topic" type="&str" required>
+  The topic the message was consumed from.
+</ParamField>
+
+<ParamField path="message" type="BrokerMessage<T>" required>
+  The `BrokerMessage` to reject. The message is consumed by value.
+</ParamField>
+
+**Returns:** `Result<(), BroccoliError>`
+
+```rust
+let message = queue.consume::<EmailJob>("emails", None).await?;
+// Processing failed — reject and let the retry strategy decide what happens next
+queue.reject("emails", message).await?;
+```
+
+---
+
+## `BroccoliQueue::cancel`
+
+```rust
+pub async fn cancel(
+    &self,
+    topic: &str,
+    message_id: String,
+) -> Result<(), BroccoliError>
+```
+
+Cancels and deletes a message from the queue by its ID, before it has been consumed. Useful for implementing job revocation or scheduled-message cancellation.
+
+<ParamField path="topic" type="&str" required>
+  The topic/queue the message resides in.
+</ParamField>
+
+<ParamField path="message_id" type="String" required>
+  The `task_id` of the message to cancel, as returned by `publish` or `publish_batch`.
+</ParamField>
+
+**Returns:** `Result<(), BroccoliError>`
+
+```rust
+let published = queue.publish("emails", None, &job, None).await?;
+
+// Later — user cancelled the request
+queue.cancel("emails", published.task_id).await?;
+```
+
+---
+
+## `BroccoliQueue::size`
+
+```rust
+pub async fn size(
+    &self,
+    queue_name: &str,
+) -> Result<std::collections::HashMap<String, u64>, BroccoliError>
+```
+
+Returns the number of messages in the specified queue. For standard queues, the map contains a single entry. For fairness queues, the map contains one entry per active disambiguator sub-queue.
+
+<ParamField path="queue_name" type="&str" required>
+  The name of the queue to inspect. For fairness queues, pass the base topic name.
+</ParamField>
+
+**Returns:** `Result<HashMap<String, u64>, BroccoliError>` — a map from queue name (or sub-queue name) to message count.
+
+```rust
+let sizes = queue.size("emails").await?;
+for (name, count) in &sizes {
+    println!("{name}: {count} messages pending");
+}
+```
+
+---
+
+## `BroccoliQueue::process_messages`
+
+```rust
+pub async fn process_messages<T, F, Fut>(
+    &self,
+    topic: &str,
+    concurrency: Option<usize>,
+    consume_options: Option<ConsumeOptions>,
+    handler: F,
+) -> Result<(), BroccoliError>
+where
+    T: DeserializeOwned + Send + Clone + Serialize + 'static,
+    F: Fn(BrokerMessage<T>) -> Fut + Send + Sync + Clone + 'static,
+    Fut: Future<Output = Result<(), BroccoliError>> + Send + 'static,
+```
+
+Starts a long-running message processing loop. Messages are consumed continuously and dispatched to `handler`. When the handler returns `Ok(())`, the message is acknowledged automatically. When it returns `Err(...)`, the message is rejected and the retry strategy takes over. This method does not return under normal operation.
+
+<ParamField path="topic" type="&str" required>
+  The topic to consume and process messages from.
+</ParamField>
+
+<ParamField path="concurrency" type="Option<usize>">
+  Number of concurrent handler tasks. When `Some(n)`, `n` independent Tokio tasks are spawned, each running their own consume loop. When `None`, messages are processed sequentially in the calling task.
+</ParamField>
+
+<ParamField path="consume_options" type="Option<ConsumeOptions>">
+  Optional consumption configuration shared across all worker tasks. See [`ConsumeOptions`](/api/consume-options).
+</ParamField>
+
+<ParamField path="handler" type="F" required>
+  An async function or closure that accepts a `BrokerMessage<T>` and returns `Result<(), BroccoliError>`. The handler is cloned for each concurrent worker, so it must be `Clone + Send + Sync + 'static`.
+</ParamField>
+
+**Returns:** `Result<(), BroccoliError>` — only returns on an unrecoverable error.
+
+```rust
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct JobPayload { id: String, task_name: String }
+
+queue.process_messages(
+    "jobs",
+    Some(4), // 4 concurrent workers
+    None,
+    |message: BrokerMessage<JobPayload>| async move {
+        println!("Processing: {}", message.payload.task_name);
+        Ok(())
+    },
+).await?;
+```
+
+---
+
+## `BroccoliQueue::process_messages_with_handlers`
+
+```rust
+pub async fn process_messages_with_handlers<T, F, MessageFut, SuccessFut, ErrorFut, S, E, R>(
+    &self,
+    topic: &str,
+    concurrency: Option<usize>,
+    consume_options: Option<ConsumeOptions>,
+    message_handler: F,
+    on_success: S,
+    on_error: E,
+) -> Result<(), BroccoliError>
+where
+    T: DeserializeOwned + Send + Clone + Serialize + 'static,
+    F: Fn(BrokerMessage<T>) -> MessageFut + Send + Sync + Clone + 'static,
+    MessageFut: Future<Output = Result<R, BroccoliError>> + Send + 'static,
+    R: Send + Clone + 'static,
+    S: Fn(BrokerMessage<T>, R) -> SuccessFut + Send + Sync + Clone + 'static,
+    SuccessFut: Future<Output = Result<(), BroccoliError>> + Send + 'static,
+    E: Fn(BrokerMessage<T>, BroccoliError) -> ErrorFut + Send + Sync + Clone + 'static,
+    ErrorFut: Future<Output = Result<(), BroccoliError>> + Send + 'static,
+```
+
+An extended version of `process_messages` that provides separate callbacks for success and error outcomes. The `message_handler` can return any `R` value on success, which is then forwarded to `on_success` — enabling result-chaining patterns such as storing the output of a computation after it completes.
+
+<ParamField path="topic" type="&str" required>
+  The topic to consume messages from.
+</ParamField>
+
+<ParamField path="concurrency" type="Option<usize>">
+  Number of concurrent worker tasks. `None` for sequential processing.
+</ParamField>
+
+<ParamField path="consume_options" type="Option<ConsumeOptions>">
+  Optional consumption configuration. See [`ConsumeOptions`](/api/consume-options).
+</ParamField>
+
+<ParamField path="message_handler" type="F" required>
+  The primary processing function. Receives a `BrokerMessage<T>` and returns `Result<R, BroccoliError>`. The result value `R` is passed to `on_success` on success.
+</ParamField>
+
+<ParamField path="on_success" type="S" required>
+  Called after `message_handler` returns `Ok(R)`. Receives the original `BrokerMessage<T>` and the result `R`. The message is acknowledged after this callback completes (unless `handler_ack` is `false`).
+</ParamField>
+
+<ParamField path="on_error" type="E" required>
+  Called after `message_handler` returns `Err(BroccoliError)`. Receives the original `BrokerMessage<T>` and the error. The message is rejected after this callback completes.
+</ParamField>
+
+**Returns:** `Result<(), BroccoliError>` — only returns on an unrecoverable error.
+
+```rust
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct JobPayload { id: String, task_name: String }
+
+async fn process_job(msg: BrokerMessage<JobPayload>) -> Result<String, BroccoliError> {
+    // Returns the result as a String
+    Ok(format!("completed:{}", msg.payload.id))
+}
+
+async fn on_success(msg: BrokerMessage<JobPayload>, result: String) -> Result<(), BroccoliError> {
+    println!("Job {} finished with result: {result}", msg.payload.id);
+    Ok(())
+}
+
+async fn on_error(msg: BrokerMessage<JobPayload>, err: BroccoliError) -> Result<(), BroccoliError> {
+    eprintln!("Job {} failed: {err:?}", msg.payload.id);
+    Ok(())
+}
+
+queue.process_messages_with_handlers(
+    "jobs",
+    Some(3),
+    None,
+    process_job,
+    on_success,
+    on_error,
+).await?;
+```
+
+---
+
+## `BroccoliQueue::queue_status`
+
+<Note>
+  This method is only available when the `management` Cargo feature is enabled.
+</Note>
+
+```rust
+#[cfg(feature = "management")]
+pub async fn queue_status(
+    &self,
+    queue_name: String,
+    disambiguator: Option<String>,
+) -> Result<QueueStatus, BroccoliError>
+```
+
+Retrieves detailed status information for a queue, including message counts across pending, processing, and failed states. Requires the `management` feature flag.
+
+<ParamField path="queue_name" type="String" required>
+  The name of the queue to inspect.
+</ParamField>
+
+<ParamField path="disambiguator" type="Option<String>">
+  For fairness queues, the disambiguator identifies which sub-queue to inspect. Pass `None` for standard queues.
+</ParamField>
+
+**Returns:** `Result<QueueStatus, BroccoliError>`
+
+```toml
+# Cargo.toml
+[dependencies]
+broccoli_queue = { version = "*", features = ["management"] }
+```
+
+```rust
+let status = queue.queue_status("emails".to_string(), None).await?;
+println!("{status:?}");
+```

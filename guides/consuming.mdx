@@ -1,0 +1,224 @@
+---
+title: "Consuming and Processing Messages from Queues"
+sidebarTitle: "Consuming"
+description: "Use process_messages, consume, try_consume, and consume_batch to read jobs from Broccoli Queue. Learn about concurrency, auto-ack, handler callbacks, and manual acknowledgment."
+---
+
+Broccoli Queue offers three distinct consumption modes to fit different processing architectures. The high-level `process_messages` and `process_messages_with_handlers` methods run an internal loop with configurable concurrency and automatic acknowledgment. For workflows that require precise control over the consume-process-acknowledge cycle, the lower-level `consume`, `try_consume`, and `consume_batch` methods let you drive each step manually.
+
+## process_messages — recommended high-level API
+
+`process_messages` spawns up to `concurrency` worker tasks that each loop forever consuming messages from the topic. Successful handler invocations are automatically acknowledged; failing invocations are automatically rejected.
+
+```rust
+pub async fn process_messages<T, F, Fut>(
+    &self,
+    topic: &str,
+    concurrency: Option<usize>,
+    consume_options: Option<ConsumeOptions>,
+    handler: F,
+) -> Result<(), BroccoliError>
+where
+    T: DeserializeOwned + Send + Clone + Serialize + 'static,
+    F: Fn(BrokerMessage<T>) -> Fut + Send + Sync + Clone + 'static,
+    Fut: Future<Output = Result<(), BroccoliError>> + Send + 'static,
+```
+
+### Example
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, ConsumeOptionsBuilder};
+use broccoli_queue::brokers::broker::BrokerMessage;
+use broccoli_queue::error::BroccoliError;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JobPayload {
+    id: String,
+    task_name: String,
+}
+
+async fn process_job(payload: JobPayload) -> Result<(), BroccoliError> {
+    println!("Processing job: {} ({})", payload.id, payload.task_name);
+    // simulate work
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .pool_connections(5)
+        .failed_message_retry_strategy(Default::default())
+        .build()
+        .await?;
+
+    // Run 4 concurrent workers. Pass a consume_wait so the loop is
+    // interruptible when spawned inside tokio::spawn.
+    queue
+        .process_messages(
+            "jobs",
+            Some(4),
+            Some(
+                ConsumeOptionsBuilder::new()
+                    .consume_wait(std::time::Duration::from_millis(1))
+                    .build(),
+            ),
+            |msg: BrokerMessage<JobPayload>| async move {
+                process_job(msg.payload).await
+            },
+        )
+        .await?;
+
+    Ok(())
+}
+```
+
+Pass `None` for `concurrency` to process messages one at a time without spawning extra tasks.
+
+## process_messages_with_handlers — explicit success and error callbacks
+
+`process_messages_with_handlers` works like `process_messages` but also invokes a dedicated `on_success` callback after a successful handler run and an `on_error` callback before rejecting a failed message.
+
+```rust
+queue.process_messages_with_handlers(
+    "jobs",
+    Some(3),
+    None,
+    process_job,
+    on_success,
+    on_error,
+).await?;
+```
+
+Define each handler as an async function with the following signatures:
+
+```rust
+use broccoli_queue::brokers::broker::BrokerMessage;
+use broccoli_queue::error::BroccoliError;
+
+// Main processing handler
+async fn process_job(
+    msg: BrokerMessage<JobPayload>,
+) -> Result<(), BroccoliError> {
+    println!("Processing: {}", msg.payload.id);
+    Ok(())
+}
+
+// Called after a successful handler run, receives the handler's return value
+async fn on_success(
+    msg: BrokerMessage<JobPayload>,
+    _result: (),
+) -> Result<(), BroccoliError> {
+    println!("Successfully processed message: {}", msg.task_id);
+    Ok(())
+}
+
+// Called before the message is rejected, receives the error from the handler
+async fn on_error(
+    msg: BrokerMessage<JobPayload>,
+    error: BroccoliError,
+) -> Result<(), BroccoliError> {
+    eprintln!("Failed to process {}: {:?}", msg.payload.id, error);
+    Ok(())
+}
+```
+
+Full usage from the consumer example:
+
+```rust
+queue
+    .process_messages_with_handlers(
+        "jobs",
+        Some(5),
+        None,
+        |msg| async move { process_job(msg.payload).await },
+        |msg, result| async { on_success(msg.payload).await },
+        |msg, err| async { on_error(msg.payload, err).await },
+    )
+    .await?;
+```
+
+## Manual consume and acknowledge
+
+For workflows that require inspecting a message before deciding how to respond, use `consume` (blocking) followed by an explicit `acknowledge` or `reject`.
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+
+let message = queue.consume::<JobPayload>("jobs", None).await?;
+
+// process the message...
+println!("Got job: {}", message.payload.id);
+
+// Remove from the processing queue on success
+queue.acknowledge("jobs", message).await?;
+
+// — or — move to the failed queue on failure
+// queue.reject("jobs", message).await?;
+```
+
+<Note>
+  `acknowledge` removes the message from the in-flight processing queue and cleans up its metadata. `reject` re-queues the message for another attempt until the retry limit is reached, at which point it is moved to the failed queue.
+</Note>
+
+## Non-blocking try_consume
+
+`try_consume` returns `Ok(None)` immediately if no message is available, making it suitable for polling loops or situations where you want to do other work while waiting.
+
+```rust
+if let Some(message) = queue.try_consume::<JobPayload>("jobs", None).await? {
+    println!("Got job: {}", message.payload.id);
+    queue.acknowledge("jobs", message).await?;
+} else {
+    println!("No messages available right now");
+}
+```
+
+## ConsumeOptions reference
+
+`ConsumeOptions` controls acknowledgment behaviour, fairness routing, and the polling interval used in tight consumer loops.
+
+```rust
+pub struct ConsumeOptions {
+    /// Automatically acknowledge the message on receipt (default: false).
+    /// Calling acknowledge/reject on an auto-acked message returns an error.
+    pub auto_ack: Option<bool>,
+    /// Enable round-robin fairness consumption (Redis broker only).
+    pub fairness: Option<bool>,
+    /// Sleep duration between iterations of tight consumer loops,
+    /// allowing the task to be cancelled via tokio::spawn abort.
+    pub consume_wait: Option<std::time::Duration>,
+    /// Acknowledge the message automatically after the handler returns Ok.
+    /// Set to false to delegate acknowledgment to another actor (default: true).
+    pub handler_ack: Option<bool>,
+}
+```
+
+### Builder pattern
+
+```rust
+use broccoli_queue::queue::ConsumeOptionsBuilder;
+
+let options = ConsumeOptionsBuilder::new()
+    .auto_ack(false)
+    .consume_wait(std::time::Duration::from_millis(5))
+    .build();
+
+let message = queue.consume::<JobPayload>("jobs", Some(options)).await?;
+```
+
+<Tip>
+  Set `handler_ack: false` when your handler spawns a long-running background task and returns immediately. In this pattern, the spawned task is responsible for calling `queue.acknowledge` or `queue.reject` when it finishes. Note that a handler that returns an `Err` still triggers an automatic `reject` even when `handler_ack` is `false`.
+</Tip>
+
+## Cancelling a queued message
+
+Use `cancel` to remove a message from the queue by its `task_id` without consuming or processing it:
+
+```rust
+// Remove the job before it is picked up by a consumer
+queue.cancel("jobs", published.task_id.to_string()).await?;
+```
+
+The message is deleted from both the main queue and any associated metadata store. Attempting to consume it afterwards returns nothing.

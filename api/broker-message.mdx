@@ -1,0 +1,97 @@
+---
+title: "BrokerMessage<T> Type Reference"
+sidebarTitle: "BrokerMessage"
+description: "BrokerMessage<T> is the typed message envelope in Broccoli Queue. Contains task_id, payload, attempts, and disambiguator. T must implement Clone, Serialize, and DeserializeOwned."
+---
+
+`BrokerMessage<T>` is the typed message wrapper returned by publish and consume methods in Broccoli Queue. Every message that flows through the system — whether published by your application or consumed from a queue — is represented as a `BrokerMessage<T>`, carrying both the typed payload and essential processing metadata. You interact with this type directly in your handlers and after calling `consume`, `try_consume`, or `publish`.
+
+## Struct Definition
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokerMessage<T: Clone> {
+    pub task_id: uuid::Uuid,
+    pub payload: T,
+    pub attempts: u8,
+    pub disambiguator: Option<String>,
+}
+```
+
+## Fields
+
+<ParamField path="task_id" type="uuid::Uuid" required>
+  Unique identifier assigned to the message when it is created. Generated as a UUIDv4 by `BrokerMessage::new`. Stable across retries — the same `task_id` is preserved if a message is rejected and re-queued.
+</ParamField>
+
+<ParamField path="payload" type="T" required>
+  The typed message content. The concrete type `T` is determined by the caller at publish or consume time. Must implement `Clone`, `serde::Serialize`, and `serde::de::DeserializeOwned`.
+</ParamField>
+
+<ParamField path="attempts" type="u8" required>
+  Number of processing attempts made so far. Starts at `0` when the message is first created and is incremented each time the message is rejected or retried. Use this field to apply escalating backoff logic or dead-letter after a threshold.
+</ParamField>
+
+<ParamField path="disambiguator" type="Option<String>">
+  Optional fairness group identifier. When set, messages with the same `disambiguator` are routed to the same fairness sub-queue, enabling fair round-robin processing across tenants or users. `None` means the message is placed in the standard queue.
+</ParamField>
+
+## Constructor
+
+```rust
+impl<T: Clone + serde::Serialize> BrokerMessage<T> {
+    pub fn new(payload: T, disambiguator: Option<String>) -> Self
+}
+```
+
+Creates a new `BrokerMessage` with a freshly generated UUIDv4 `task_id`, `attempts` set to `0`, and the provided `payload` and optional `disambiguator`. You rarely need to call this directly — `BroccoliQueue::publish` constructs the message for you.
+
+## Type Constraint
+
+The type parameter `T` must satisfy:
+
+```rust
+T: Clone + serde::Serialize + serde::de::DeserializeOwned
+```
+
+This ensures the payload can be cloned for internal processing, serialized to JSON for wire transport, and deserialized back into a strongly typed value on the consumer side.
+
+## Defining a Payload Type
+
+Any struct that derives `Debug`, `Clone`, `Serialize`, and `Deserialize` can be used as a payload:
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EmailJob {
+    recipient: String,
+    subject: String,
+    body: String,
+}
+```
+
+## Consuming and Inspecting a Message
+
+After consuming from the queue, the returned `BrokerMessage<T>` exposes all fields directly:
+
+```rust
+let msg = queue.consume::<EmailJob>("email-jobs", None).await?;
+
+println!("Task ID:  {}", msg.task_id);
+println!("Attempts: {}", msg.attempts);
+println!("To:       {}", msg.payload.recipient);
+println!("Subject:  {}", msg.payload.subject);
+```
+
+Once you have finished processing, acknowledge the message to remove it from the processing queue, or reject it to trigger retry logic:
+
+```rust
+// Successful processing
+queue.acknowledge("email-jobs", msg).await?;
+
+// Processing failed — increment attempts and re-queue (or move to failed queue)
+queue.reject("email-jobs", msg).await?;
+```
+
+<Note>
+  `task_id` is a `uuid::Uuid` value. If you need a plain string — for logging, tracing headers, or database keys — call `.to_string()` on it: `msg.task_id.to_string()`. The string representation follows the standard hyphenated UUID format (e.g. `550e8400-e29b-41d4-a716-446655440000`).
+</Note>

@@ -1,0 +1,98 @@
+---
+title: "BrokerConfig: Low-Level Broker Configuration"
+sidebarTitle: "BrokerConfig"
+description: "BrokerConfig holds low-level configuration for Broccoli Queue broker backends: retry attempts, retry behavior, connection pool size, and scheduling support."
+---
+
+`BrokerConfig` is the internal configuration struct that is assembled by `BroccoliQueueBuilder` and passed down to broker backend implementations during initialization. It controls runtime behaviour such as how many times a failed message is retried, how large the connection pool is, and whether scheduled delivery is enabled. Application code typically does not construct `BrokerConfig` directly — the builder methods on `BroccoliQueueBuilder` are the recommended way to configure these values.
+
+## Struct Definition
+
+```rust
+#[derive(Debug, Clone)]
+pub struct BrokerConfig {
+    pub retry_attempts: Option<u8>,      // default: Some(3)
+    pub retry_failed: Option<bool>,      // default: Some(true)
+    pub pool_connections: Option<u8>,    // default: Some(10)
+    pub enable_scheduling: Option<bool>, // default: Some(false)
+}
+```
+
+## Fields
+
+<ParamField path="retry_attempts" type="Option<u8>" default="Some(3)">
+  Maximum number of times a rejected message will be re-queued before being moved to the failed queue. When `None`, the broker falls back to the compile-time default of `3`. Set to `Some(0)` to disable retries entirely and move failed messages directly to the failed queue on the first rejection.
+</ParamField>
+
+<ParamField path="retry_failed" type="Option<bool>" default="Some(true)">
+  Controls whether rejected messages are re-queued at all. When `Some(false)`, every rejection immediately moves the message to the failed queue regardless of `retry_attempts`. When `None`, defaults to `true`.
+</ParamField>
+
+<ParamField path="pool_connections" type="Option<u8>" default="Some(10)">
+  Number of connections to maintain in the broker connection pool. Higher values improve throughput under concurrent publish/consume workloads at the cost of memory and connection overhead on the broker. When `None`, defaults to `10`.
+</ParamField>
+
+<ParamField path="enable_scheduling" type="Option<bool>" default="Some(false)">
+  Enables support for delayed and scheduled message delivery. When `Some(true)`, publishers may use `PublishOptions::delay` and `PublishOptions::scheduled_at`. When `None`, defaults to `false` (scheduling disabled).
+
+  **RabbitMQ note:** enabling scheduling with RabbitMQ requires the [rabbitmq-delayed-message-exchange](https://www.rabbitmq.com/blog/2015/04/16/scheduling-messages-with-rabbitmq) plugin to be installed on the broker.
+</ParamField>
+
+## Default Values
+
+The `Default` implementation reflects the recommended starting configuration for most workloads:
+
+```rust
+impl Default for BrokerConfig {
+    fn default() -> Self {
+        Self {
+            retry_attempts: Some(3),
+            retry_failed: Some(true),
+            pool_connections: Some(10),
+            enable_scheduling: Some(false),
+        }
+    }
+}
+```
+
+## Builder-to-Config Mapping
+
+`BrokerConfig` is populated internally by `BroccoliQueueBuilder::build()`. Each builder method maps to a specific config field:
+
+| Builder method | `BrokerConfig` field(s) set |
+|---|---|
+| `.pool_connections(n)` | `config.pool_connections = Some(n)` |
+| `.failed_message_retry_strategy(s)` | `config.retry_attempts = s.attempts`<br/>`config.retry_failed = Some(s.retry_failed)` |
+| `.enable_scheduling(b)` | `config.enable_scheduling = Some(b)` |
+
+For example, to configure a queue with 5 pool connections, 5 retry attempts, and scheduling enabled:
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, RetryStrategy};
+
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .pool_connections(5)
+    .failed_message_retry_strategy(
+        RetryStrategy::new()
+            .with_attempts(5)
+            .retry_failed(true)
+    )
+    .enable_scheduling(true)
+    .build()
+    .await?;
+```
+
+The resulting `BrokerConfig` passed to the backend will be:
+
+```rust
+BrokerConfig {
+    retry_attempts: Some(5),
+    retry_failed: Some(true),
+    pool_connections: Some(5),
+    enable_scheduling: Some(true),
+}
+```
+
+<Tip>
+  Prefer using the fluent builder API rather than constructing `BrokerConfig` manually. See the [BroccoliQueue Builder](/api/broccoli-queue) reference for the full set of builder options, including the `RetryStrategy` type.
+</Tip>
