@@ -1,7 +1,7 @@
 ---
-title: "Messages and Payloads in Broccoli Queue"
+title: "BrokerMessage: Messages and Payloads in Broccoli Queue"
 sidebarTitle: "Messages"
-description: "BrokerMessage<T> is the typed message wrapper in Broccoli Queue. Understand task_id, payload, attempts, disambiguator, and how serialization works with Serde."
+description: "BrokerMessage<T> wraps your payload with task_id, attempts, and disambiguator. Learn how Broccoli Queue serializes and routes messages with Serde."
 ---
 
 Every piece of work that travels through Broccoli Queue is wrapped in a `BrokerMessage<T>`. This generic struct carries your custom payload alongside the metadata the queue system needs to route, track, and retry the message: a unique identifier, an attempt counter, and an optional disambiguator used for fairness scheduling. `BrokerMessage<T>` is what your handler function receives, and it is what `publish` returns so you can record the assigned `task_id` on the caller's side.

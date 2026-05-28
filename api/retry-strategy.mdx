@@ -1,7 +1,7 @@
 ---
-title: "RetryStrategy and RetryStrategyBuilder Reference"
+title: "RetryStrategy Reference: Broccoli Queue Failure Handling"
 sidebarTitle: "RetryStrategy"
-description: "Reference for RetryStrategy: configure retry behavior for failed messages in Broccoli Queue, including maximum attempts and whether failed messages should be retried."
+description: "Reference for RetryStrategy: configure retry behavior for failed messages in Broccoli Queue, including maximum attempts and retry-on-failure toggle."
 ---
 
 `RetryStrategy` controls what happens to a message after it is rejected — either by an explicit `queue.reject(...)` call or by a handler returning `Err(...)` inside `process_messages`. You can allow the broker to automatically re-queue the message for another delivery attempt up to a configurable maximum, or disable retrying entirely so that failed messages move straight to the dead-letter queue. Configure the strategy once on the `BroccoliQueueBuilder` and it applies globally to every topic on that queue instance.

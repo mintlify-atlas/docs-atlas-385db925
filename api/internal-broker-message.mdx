@@ -1,7 +1,7 @@
 ---
-title: "InternalBrokerMessage: Serialized Message Format"
+title: "InternalBrokerMessage: Broker Wire Format Reference"
 sidebarTitle: "InternalBrokerMessage"
-description: "InternalBrokerMessage is the serialized wire format used internally by Broccoli Queue brokers. Understanding it helps when implementing custom broker backends."
+description: "InternalBrokerMessage is the serialized wire format used by Broccoli Queue brokers internally. Relevant primarily when implementing custom broker backends."
 ---
 
 `InternalBrokerMessage` is the internal serialized representation that broker implementations use to transport messages over the wire and store them in the underlying backend (Redis, RabbitMQ, SurrealDB, or a custom store). It holds the same logical fields as `BrokerMessage<T>`, but with `task_id` as a plain `String` and `payload` as a JSON-serialized `String` rather than a strongly typed value. Most application code never needs to construct or inspect this type directly — it surfaces only when implementing the `Broker` trait.

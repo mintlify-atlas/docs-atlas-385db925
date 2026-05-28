@@ -1,7 +1,7 @@
 ---
-title: "Management API: Queue Status and Monitoring"
+title: "Management API: Runtime Queue Status and Monitoring"
 sidebarTitle: "Management"
-description: "The management feature exposes QueueStatus, QueueType, and the QueueManagement trait for runtime queue inspection. Enable with the management feature flag in Cargo.toml."
+description: "The management feature exposes QueueStatus, QueueType, and the QueueManagement trait for runtime queue inspection. Enable with the management feature flag."
 ---
 
 The management API lets you inspect live queue state at runtime without reaching into the broker directly. It provides a structured `QueueStatus` snapshot that reports how many messages are waiting, how many are currently being processed, how many have failed, and — for fairness queues — how many disambiguator sub-queues exist. This is useful for dashboards, alerting, autoscaling signals, and operator tooling.
@@ -59,20 +59,25 @@ pub struct QueueStatus {
 `QueueType` identifies which logical segment of a queue a status report refers to:
 
 ```rust
+#[derive(Debug, Clone, PartialEq, Eq, Display)]
 pub enum QueueType {
-    Failed,     // failed message queue
-    Processing, // in-flight message queue
-    Main,       // main topic queue
-    Fairness,   // fairness-mode queue
+    #[display("failed")]
+    Failed,
+    #[display("processing")]
+    Processing,
+    #[display("main")]
+    Main,
+    #[display("fairness")]
+    Fairness,
 }
 ```
 
-| Variant | Description |
-|---|---|
-| `Main` | The primary queue where new messages are published and waiting to be consumed. |
-| `Processing` | The in-flight queue holding messages that have been picked up by a worker but not yet acknowledged. |
-| `Failed` | The dead-letter queue holding messages that have exceeded `retry_attempts`. |
-| `Fairness` | A fairness-partitioned queue where messages are distributed across disambiguator sub-queues. |
+| Variant | `Display` output | Description |
+|---|---|---|
+| `Main` | `"main"` | The primary queue where new messages are published and waiting to be consumed. |
+| `Processing` | `"processing"` | The in-flight queue holding messages that have been picked up by a worker but not yet acknowledged. |
+| `Failed` | `"failed"` | The dead-letter queue holding messages that have exceeded `retry_attempts`. |
+| `Fairness` | `"fairness"` | A fairness-partitioned queue where messages are distributed across disambiguator sub-queues. |
 
 ## `QueueManagement` Trait
 

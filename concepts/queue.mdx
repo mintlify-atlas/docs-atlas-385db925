@@ -1,7 +1,7 @@
 ---
 title: "Understanding the BroccoliQueue: Rust Job Queue Core"
 sidebarTitle: "Queue"
-description: "The BroccoliQueue struct is the central interface for publishing, consuming, and processing messages. Learn how it wraps broker implementations and manages workers."
+description: "BroccoliQueue is the core interface for publishing, consuming, and processing messages via pluggable broker backends in the broccoli_queue crate."
 ---
 
 `BroccoliQueue` is the primary entry point for every interaction with the message queue. It wraps a pluggable broker backend — Redis, RabbitMQ, or SurrealDB — behind a single, uniform async API. Once built, a `BroccoliQueue` instance lets you publish messages to named topics, consume them individually or in batches, acknowledge successful processing, reject failures, and run long-lived worker loops with configurable concurrency. Because all I/O goes through an internally managed connection pool, you never have to juggle raw connections yourself.

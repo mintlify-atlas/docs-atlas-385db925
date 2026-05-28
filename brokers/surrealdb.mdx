@@ -24,13 +24,13 @@ The `kv-mem` SurrealDB feature is included automatically, which enables the in-m
     Connect to a running SurrealDB server over WebSocket. Namespace, database, and credentials are provided as query parameters:
 
     ```
-    ws://host:port?ns=myns&db=mydb&username=root&password=root
+    ws://host:port?ns=myns&database=mydb&username=root&password=root
     ```
 
     | Parameter | Required | Description |
     |---|---|---|
     | `ns` | Yes | SurrealDB namespace |
-    | `db` | Yes | SurrealDB database |
+    | `database` | Yes | SurrealDB database |
     | `username` | Yes | Authentication username |
     | `password` | Yes | Authentication password |
 
@@ -49,7 +49,7 @@ The `kv-mem` SurrealDB feature is included automatically, which enables the in-m
 
 ```rust
 let queue = BroccoliQueue::builder(
-    "ws://localhost:8000?ns=myns&db=mydb&username=root&password=root"
+    "ws://localhost:8000?ns=myns&database=mydb&username=root&password=root"
 )
 .build()
 .await?;
@@ -93,16 +93,16 @@ Because the in-memory engine is embedded in the process, there is no network rou
 Broccoli Queue creates the following SurrealDB tables for each topic. All tables are named after the topic with a suffix:
 
 <CardGroup cols={2}>
-  <Card title="Message Table" icon="envelope" href="https://surrealdb.com/docs/surrealql/statements/define/table">
+  <Card title="Message Table" icon="envelope" href="/api/broker-message">
     One record per message, keyed by `{queue_name}:{task_id}`. Stores `task_id`, `payload`, and `attempts`.
   </Card>
-  <Card title="Queue Entry Table" icon="layer-group" href="https://surrealdb.com/docs/surrealql/statements/define/table">
-    One record per queued message, keyed by `{queue_name}_queue:[priority, timestamp, task_id]`. Stores `message_id`, `priority`, and `timestamp` for ordering.
+  <Card title="Queue Entry Table" icon="layer-group" href="/concepts/brokers">
+    One record per queued message, keyed by `{queue_name}___queue:[priority, timestamp, task_id]`. Stores `message_id`, `priority`, and `timestamp` for ordering.
   </Card>
-  <Card title="Processing Table" icon="spinner" href="https://surrealdb.com/docs/surrealql/statements/define/table">
+  <Card title="Processing Table" icon="spinner" href="/concepts/messages">
     Tracks messages currently being processed. Records are removed on `acknowledge` and either re-enqueued or moved to failed on `reject`.
   </Card>
-  <Card title="Failed Table" icon="circle-xmark" href="https://surrealdb.com/docs/surrealql/statements/define/table">
+  <Card title="Failed Table" icon="circle-xmark" href="/concepts/retry-strategy">
     Holds messages that have exceeded the configured retry limit, along with the original message content and a timestamp.
   </Card>
 </CardGroup>

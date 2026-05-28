@@ -1,5 +1,5 @@
 ---
-title: "BroccoliQueue API Reference"
+title: "BroccoliQueue API: Publish, Consume, and Process Messages"
 sidebarTitle: "BroccoliQueue"
 description: "Complete API reference for BroccoliQueue: the main interface for publishing, consuming, acknowledging, and processing messages in Broccoli Queue."
 ---
@@ -208,6 +208,8 @@ Attempts to consume a message without blocking. Returns `None` immediately if no
 **Returns:** `Result<Option<BrokerMessage<T>>, BroccoliError>` — `Ok(Some(msg))` if a message was available, `Ok(None)` if the queue was empty.
 
 ```rust
+use std::time::Duration;
+
 if let Some(message) = queue.try_consume::<EmailJob>("emails", None).await? {
     process(&message).await?;
     queue.acknowledge("emails", message).await?;

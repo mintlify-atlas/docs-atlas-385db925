@@ -1,7 +1,7 @@
 ---
-title: "Inspecting Queue Status with the Management API"
+title: "Broccoli Queue Management API: Inspect Queue Health"
 sidebarTitle: "Management API"
-description: "The management feature flag unlocks queue_status for inspecting pending, processing, and failed message counts. Monitor queue health programmatically from your application."
+description: "The management feature flag unlocks queue_status to inspect pending, processing, and failed message counts on Redis and RabbitMQ brokers."
 ---
 
 Broccoli Queue ships a management API that exposes live queue metrics: how many messages are pending, how many are being processed in-flight, and how many have been moved to the failed queue. This information is useful for dashboards, alerting, and autoscaling decisions.
@@ -16,6 +16,10 @@ Add the `management` feature alongside your broker feature in `Cargo.toml`:
 [dependencies]
 broccoli_queue = { version = "0.4", features = ["redis", "management"] }
 ```
+
+<Note>
+  The `management` feature is supported by the **Redis** and **RabbitMQ** brokers only. SurrealDB does not implement `QueueManagement` and cannot be used together with the `management` feature flag.
+</Note>
 
 ## queue_status API
 

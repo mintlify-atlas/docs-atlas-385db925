@@ -58,16 +58,16 @@ docker run -p 6379:6379 redis:latest
 Understanding how Broccoli Queue maps its abstractions onto Redis primitives helps with debugging and capacity planning.
 
 <CardGroup cols={2}>
-  <Card title="Sorted Set — Main Queue" icon="layer-group" href="https://redis.io/docs/data-types/sorted-sets/">
+  <Card title="Sorted Set — Main Queue" icon="layer-group" href="/concepts/brokers">
     Each topic is stored as a Redis sorted set (`ZADD`). The score is computed as `priority × timestamp_nanoseconds`, so lower scores are consumed first.
   </Card>
-  <Card title="List — Processing Queue" icon="list" href="https://redis.io/docs/data-types/lists/">
+  <Card title="List — Processing Queue" icon="list" href="/concepts/messages">
     When a message is dequeued for processing it is pushed onto a `{queue_name}_processing` list (`LPUSH`). On acknowledgement it is removed with `LREM`.
   </Card>
-  <Card title="List — Failed Queue" icon="circle-exclamation" href="https://redis.io/docs/data-types/lists/">
+  <Card title="List — Failed Queue" icon="circle-exclamation" href="/concepts/retry-strategy">
     Messages that exceed the configured retry limit are pushed onto a `{queue_name}_failed` list via `LPUSH`.
   </Card>
-  <Card title="Hash — Message Storage" icon="database" href="https://redis.io/docs/data-types/hashes/">
+  <Card title="Hash — Message Storage" icon="database" href="/api/broker-message">
     Each individual message is stored as a Redis hash (`HSET`) keyed by `task_id`, containing the fields `task_id`, `payload`, `attempts`, and `priority`.
   </Card>
 </CardGroup>

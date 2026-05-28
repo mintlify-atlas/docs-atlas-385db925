@@ -1,7 +1,7 @@
 ---
-title: "Configuring Retry Strategies for Failed Messages"
+title: "Configuring Retry Strategies for Failed Queue Messages"
 sidebarTitle: "Retry Strategy"
-description: "RetryStrategy controls how Broccoli Queue handles failed messages: number of attempts, whether to retry, and routing to the failed queue after max attempts."
+description: "RetryStrategy controls how Broccoli Queue handles failed messages: attempt count, retry toggle, and automatic routing to the failed queue on exhaustion."
 ---
 
 When a message handler returns an error, Broccoli Queue does not discard the message silently. Instead, it follows a configurable retry lifecycle: the message is rejected back to the broker, the attempt counter is incremented, and — depending on your `RetryStrategy` — the message is either re-queued for another attempt or moved permanently to a dedicated failed queue named `{topic}_failed`. This gives you a predictable safety net for transient failures while ensuring that persistently bad messages do not loop forever.

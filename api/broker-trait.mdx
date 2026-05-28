@@ -1,7 +1,7 @@
 ---
-title: "Broker Trait: Implementing Custom Broker Backends"
+title: "Broker Trait: Implementing a Custom Broker Backend"
 sidebarTitle: "Broker Trait"
-description: "The Broker async trait defines the interface all Broccoli Queue broker backends must implement. Use it to build custom broker backends beyond Redis, RabbitMQ, and SurrealDB."
+description: "The Broker async trait defines the interface all Broccoli Queue backends must implement. Build custom brokers beyond Redis, RabbitMQ, and SurrealDB."
 ---
 
 The `Broker` trait is the core abstraction that every queue backend in Broccoli Queue must satisfy. The built-in backends — Redis, RabbitMQ, and SurrealDB — all implement this trait, and you can implement it yourself to connect any storage system as a message broker. All methods are async and the trait requires `Send + Sync` so implementations can be shared safely across Tokio tasks.

@@ -1,7 +1,7 @@
 ---
-title: "Fair Queue Scheduling with Disambiguators"
+title: "Fair Queue Scheduling with Disambiguators in Broccoli"
 sidebarTitle: "Fairness Queues"
-description: "Broccoli Queue's fairness mode uses a round-robin disambiguator system to prevent any single producer from monopolizing the queue. Only supported by the Redis broker."
+description: "Broccoli Queue fairness mode uses round-robin disambiguators to give each producer equal throughput. Supported only by the Redis broker."
 ---
 
 In a standard queue, a producer that publishes a large burst of messages causes those messages to be processed before anything from slower or less frequent producers. In a multi-tenant system — where each tenant, job type, or user maps to a separate stream of work — this creates starvation: a busy tenant monopolises the workers while quieter tenants wait indefinitely.
@@ -157,7 +157,7 @@ Consider two disambiguators: `tenant-a` with 10 pending messages and `tenant-b` 
 No single producer can hold the workers hostage regardless of burst size. When a disambiguator's sub-queue empties, it is removed from the rotation automatically.
 
 <Note>
-  Fairness mode is implemented exclusively by the **Redis broker**. The RabbitMQ and SurrealDB brokers do not support disambiguators. Passing `fairness: true` with a non-Redis broker is silently ignored.
+  Fairness mode is implemented exclusively by the **Redis broker**. The RabbitMQ and SurrealDB brokers do not support disambiguators or fairness-queue routing. Ensure you are using the Redis broker before enabling `fairness: true` in `ConsumeOptions`.
 </Note>
 
 <Warning>

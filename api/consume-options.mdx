@@ -1,7 +1,7 @@
 ---
 title: "ConsumeOptions and ConsumeOptionsBuilder Reference"
 sidebarTitle: "ConsumeOptions"
-description: "Reference for ConsumeOptions: configure auto-ack, fairness round-robin, polling interval, and handler acknowledgment behavior when consuming from Broccoli Queue."
+description: "Reference for ConsumeOptions: configure auto-ack, fairness round-robin, polling interval, and handler-ack behavior when consuming from Broccoli Queue."
 ---
 
 `ConsumeOptions` gives you fine-grained control over how messages are fetched and confirmed during consumption. You can instruct the broker to automatically acknowledge messages the moment they are delivered, opt in to fair round-robin distribution across competing consumers, tune the polling cadence in tight loops, and control whether a successful handler automatically acknowledges the message or leaves that responsibility to another actor. Pass a `ConsumeOptions` value to any `consume`, `try_consume`, or `process_messages` call to override the defaults.

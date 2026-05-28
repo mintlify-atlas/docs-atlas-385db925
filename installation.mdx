@@ -1,5 +1,5 @@
 ---
-title: "Install Broccoli Queue in Your Rust Project"
+title: "Install Broccoli Queue: Cargo.toml Setup and Feature Flags"
 sidebarTitle: "Installation"
 description: "Add broccoli_queue to Cargo.toml with the right feature flags for Redis, RabbitMQ, or SurrealDB. Covers version pinning and the optional management API."
 ---
@@ -69,7 +69,7 @@ Broccoli Queue is published on [crates.io](https://crates.io/crates/broccoli_que
     serde = { version = "1", features = ["derive"] }
     ```
 
-    Connect with a WebSocket URL pointing to your SurrealDB instance:
+    Connect with a WebSocket URL pointing to your SurrealDB instance, or use `mem://` for an in-process in-memory database useful for testing:
 
     ```rust
     let queue = BroccoliQueue::builder("ws://localhost:8000")
@@ -107,7 +107,7 @@ Broccoli Queue is published on [crates.io](https://crates.io/crates/broccoli_que
     serde = { version = "1", features = ["derive"] }
     ```
 
-    At runtime, the broker is selected by the URL scheme you pass to `BroccoliQueue::builder`: `redis://`, `rediss://`, `amqp://`, `amqps://`, or `ws://` / `wss://`.
+    At runtime, the broker is selected by the URL scheme you pass to `BroccoliQueue::builder`: `redis://`, `rediss://`, `amqp://`, `amqps://`, `ws://`, `wss://`, or `mem://` (SurrealDB in-memory).
   </Tab>
 </Tabs>
 
@@ -122,7 +122,7 @@ Broccoli Queue is published on [crates.io](https://crates.io/crates/broccoli_que
 </ParamField>
 
 <ParamField path="surrealdb" type="feature flag" default="disabled">
-  Enables the SurrealDB broker backend via the official [`surrealdb`](https://crates.io/crates/surrealdb) crate (version 2.x). Supports `ws://` and `wss://` URLs, and also exposes `BroccoliQueue::builder_with(db)` for passing an existing connection. Requires `default-features = false` if you do not also want Redis.
+  Enables the SurrealDB broker backend via the official [`surrealdb`](https://crates.io/crates/surrealdb) crate (version 2.x). Supports `ws://`, `wss://`, and `mem://` (in-memory) URLs, and also exposes `BroccoliQueue::builder_with(db)` for passing an existing connection. Requires `default-features = false` if you do not also want Redis.
 </ParamField>
 
 <ParamField path="management" type="feature flag" default="disabled">

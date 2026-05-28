@@ -1,7 +1,7 @@
 ---
-title: "BrokerConfig: Low-Level Broker Configuration"
+title: "BrokerConfig: Broker Backend Configuration Reference"
 sidebarTitle: "BrokerConfig"
-description: "BrokerConfig holds low-level configuration for Broccoli Queue broker backends: retry attempts, retry behavior, connection pool size, and scheduling support."
+description: "BrokerConfig holds runtime configuration for Broccoli Queue broker backends: retry attempts, retry behavior, connection pool size, and scheduling support."
 ---
 
 `BrokerConfig` is the internal configuration struct that is assembled by `BroccoliQueueBuilder` and passed down to broker backend implementations during initialization. It controls runtime behaviour such as how many times a failed message is retried, how large the connection pool is, and whether scheduled delivery is enabled. Application code typically does not construct `BrokerConfig` directly — the builder methods on `BroccoliQueueBuilder` are the recommended way to configure these values.
@@ -15,6 +15,8 @@ pub struct BrokerConfig {
     pub retry_failed: Option<bool>,      // default: Some(true)
     pub pool_connections: Option<u8>,    // default: Some(10)
     pub enable_scheduling: Option<bool>, // default: Some(false)
+    // Only present with the `surrealdb` feature:
+    // pub surrealdb_connection: Option<surrealdb::Surreal<surrealdb::engine::any::Any>>,
 }
 ```
 
@@ -36,6 +38,10 @@ pub struct BrokerConfig {
   Enables support for delayed and scheduled message delivery. When `Some(true)`, publishers may use `PublishOptions::delay` and `PublishOptions::scheduled_at`. When `None`, defaults to `false` (scheduling disabled).
 
   **RabbitMQ note:** enabling scheduling with RabbitMQ requires the [rabbitmq-delayed-message-exchange](https://www.rabbitmq.com/blog/2015/04/16/scheduling-messages-with-rabbitmq) plugin to be installed on the broker.
+</ParamField>
+
+<ParamField path="surrealdb_connection" type="Option<surrealdb::Surreal<surrealdb::engine::any::Any>>">
+  *(Only present when the `surrealdb` feature is enabled.)* An existing SurrealDB connection to reuse rather than opening a new one. When `None`, the broker opens its own connection using `broker_url`. Use this when you want to share a connection that is already managed by your application — for example, one created with `Surreal::connect`. Set via `BroccoliQueueBuilder::new_with_surrealdb`.
 </ParamField>
 
 ## Default Values

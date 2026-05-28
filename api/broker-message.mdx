@@ -1,7 +1,7 @@
 ---
-title: "BrokerMessage<T> Type Reference"
+title: "BrokerMessage<T>: Typed Message Envelope Reference"
 sidebarTitle: "BrokerMessage"
-description: "BrokerMessage<T> is the typed message envelope in Broccoli Queue. Contains task_id, payload, attempts, and disambiguator. T must implement Clone, Serialize, and DeserializeOwned."
+description: "BrokerMessage<T> is the typed message envelope in Broccoli Queue. Carries task_id, payload, attempts, and disambiguator. T requires Clone and Serialize."
 ---
 
 `BrokerMessage<T>` is the typed message wrapper returned by publish and consume methods in Broccoli Queue. Every message that flows through the system — whether published by your application or consumed from a queue — is represented as a `BrokerMessage<T>`, carrying both the typed payload and essential processing metadata. You interact with this type directly in your handlers and after calling `consume`, `try_consume`, or `publish`.
@@ -25,7 +25,7 @@ pub struct BrokerMessage<T: Clone> {
 </ParamField>
 
 <ParamField path="payload" type="T" required>
-  The typed message content. The concrete type `T` is determined by the caller at publish or consume time. Must implement `Clone`, `serde::Serialize`, and `serde::de::DeserializeOwned`.
+  The typed message content. The concrete type `T` is determined by the caller at publish or consume time. Must implement `Clone` and `serde::Serialize` to construct the message; `serde::de::DeserializeOwned` is additionally required when calling `into_message::<T>()` to recover the typed value from an `InternalBrokerMessage`.
 </ParamField>
 
 <ParamField path="attempts" type="u8" required>
@@ -46,15 +46,26 @@ impl<T: Clone + serde::Serialize> BrokerMessage<T> {
 
 Creates a new `BrokerMessage` with a freshly generated UUIDv4 `task_id`, `attempts` set to `0`, and the provided `payload` and optional `disambiguator`. You rarely need to call this directly — `BroccoliQueue::publish` constructs the message for you.
 
-## Type Constraint
+## Type Constraints
 
-The type parameter `T` must satisfy:
+The type parameter `T` on the struct itself only requires `Clone`. The constructor `BrokerMessage::new` additionally requires `Serialize`:
 
 ```rust
+// Struct bound
+T: Clone
+
+// new() bound
+T: Clone + serde::Serialize
+```
+
+When calling `InternalBrokerMessage::into_message::<T>()` to recover a typed message, `T` must also implement `DeserializeOwned`:
+
+```rust
+// into_message() bound
 T: Clone + serde::Serialize + serde::de::DeserializeOwned
 ```
 
-This ensures the payload can be cloned for internal processing, serialized to JSON for wire transport, and deserialized back into a strongly typed value on the consumer side.
+This layered constraint ensures the payload can be cloned for internal processing, serialized to JSON for wire transport, and deserialized back into a strongly typed value on the consumer side.
 
 ## Defining a Payload Type
 

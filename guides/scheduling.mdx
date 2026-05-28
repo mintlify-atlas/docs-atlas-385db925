@@ -1,10 +1,10 @@
 ---
 title: "Scheduling and Delaying Messages in Broccoli Queue"
 sidebarTitle: "Scheduling"
-description: "Delay messages by a duration or schedule them at a precise timestamp using PublishOptions. Requires enable_scheduling on the queue builder. RabbitMQ needs the delayed-exchange plugin."
+description: "Delay messages by a duration or schedule them at a precise UTC timestamp using PublishOptions. Requires enable_scheduling on the queue builder."
 ---
 
-Broccoli Queue supports two scheduling strategies: a **relative delay** that makes a message visible after a given duration has elapsed, and an **absolute schedule** that pins delivery to a specific UTC timestamp. Both strategies are expressed through `PublishOptions` and work identically across the Redis and SurrealDB brokers.
+Broccoli Queue supports two scheduling strategies: a **relative delay** that makes a message visible after a given duration has elapsed, and an **absolute schedule** that pins delivery to a specific UTC timestamp. Both strategies are expressed through `PublishOptions` and are supported across Redis, RabbitMQ, and SurrealDB brokers.
 
 Scheduling is an optional capability — it is disabled by default to avoid any overhead on queues that do not need it.
 

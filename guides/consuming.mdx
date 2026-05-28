@@ -1,10 +1,10 @@
 ---
-title: "Consuming and Processing Messages from Queues"
+title: "Consuming and Processing Messages from Broccoli Queue"
 sidebarTitle: "Consuming"
-description: "Use process_messages, consume, try_consume, and consume_batch to read jobs from Broccoli Queue. Learn about concurrency, auto-ack, handler callbacks, and manual acknowledgment."
+description: "Use process_messages, consume, and try_consume to read jobs from Broccoli Queue. Learn about concurrency, auto-ack, and manual acknowledgment."
 ---
 
-Broccoli Queue offers three distinct consumption modes to fit different processing architectures. The high-level `process_messages` and `process_messages_with_handlers` methods run an internal loop with configurable concurrency and automatic acknowledgment. For workflows that require precise control over the consume-process-acknowledge cycle, the lower-level `consume`, `try_consume`, and `consume_batch` methods let you drive each step manually.
+Broccoli Queue offers multiple consumption modes to fit different processing architectures. The high-level `process_messages` and `process_messages_with_handlers` methods run an internal loop with configurable concurrency and automatic acknowledgment. For workflows that require precise control over the consume-process-acknowledge cycle, the lower-level `consume` and `try_consume` methods let you drive each step manually.
 
 ## process_messages — recommended high-level API
 

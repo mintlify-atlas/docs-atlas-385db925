@@ -1,7 +1,7 @@
 ---
-title: "BroccoliError: Error Types Reference"
+title: "BroccoliError: Complete Error Type Reference Guide"
 sidebarTitle: "Errors"
-description: "BroccoliError enumerates all error conditions in Broccoli Queue: broker connection failures, publish/consume errors, serialization, and broker-specific errors for Redis and SurrealDB."
+description: "BroccoliError covers all Broccoli Queue errors: broker failures, publish and consume errors, serialization, and feature-gated Redis and SurrealDB variants."
 ---
 
 All fallible operations in Broccoli Queue return `Result<T, BroccoliError>`. The error type is defined with [`thiserror`](https://docs.rs/thiserror), which generates ergonomic `Display` and `From` implementations automatically. This means you can use `?` to propagate errors, match on specific variants for targeted recovery, and rely on `From` conversions for `serde_json::Error` and — when the relevant feature flags are enabled — `redis::RedisError` and `surrealdb::Error`.

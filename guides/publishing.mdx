@@ -1,7 +1,7 @@
 ---
-title: "Publishing Messages to Broccoli Queue Topics"
+title: "Publishing Messages to Broccoli Queue with publish"
 sidebarTitle: "Publishing"
-description: "Publish single messages, batches, delayed messages, and priority-ordered jobs to Broccoli Queue topics using the publish and publish_batch methods."
+description: "Publish single messages, batches, delayed jobs, and priority-ordered work to Broccoli Queue topics using the publish and publish_batch methods."
 ---
 
 Broccoli Queue supports four publishing patterns that cover most production workloads: simple point-in-time publishing, batching multiple messages in a single call, delaying delivery by a duration, and scheduling delivery at an exact timestamp. All four patterns share the same underlying `publish` and `publish_batch` methods and are controlled through the `PublishOptions` struct.
